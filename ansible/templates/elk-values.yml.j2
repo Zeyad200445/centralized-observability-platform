@@ -1,0 +1,629 @@
+# ===========================================================================
+# elk-values.yml.j2
+#
+# ONE template, FOUR Helm releases. The playbook renders this file, loads it
+# back as a dict and hands each release only its own sub-tree:
+#
+#   elk_values.elasticsearch -> elastic/elasticsearch
+#   elk_values.logstash      -> elastic/logstash
+#   elk_values.kibana        -> elastic/kibana
+#   elk_values.filebeat      -> elastic/filebeat
+#
+# Keeping them together is deliberate: the four components share ports,
+# service names and credentials, and splitting them into four files is how
+# those references silently drift apart.
+#
+# Rendered output lands in ansible/rendered/elk-values.yml - diff it before
+# blaming Helm.
+# ===========================================================================
+
+# ===========================================================================
+# 1. ELASTICSEARCH - StatefulSet + PersistentVolumeClaim, port 9200
+# ===========================================================================
+elasticsearch:
+  clusterName: "{{ elasticsearch_cluster_name }}"
+  nodeGroup: master
+
+  # منع الكونتينر إنه يدور على ماستر تاني لو إحنا شغالين محلي (Single Node)
+{% if is_emulated | bool %}
+  clusterInitialMasterNodes: ""
+{% endif %}
+
+  # Every node is master+data+ingest. Splitting roles only pays off well
+  # past the scale this platform targets.
+  roles:
+    - master
+    - data
+    - data_content
+    - data_hot
+    - ingest
+    - remote_cluster_client
+
+  replicas: {{ elasticsearch_replicas }}
+  minimumMasterNodes: {{ ((elasticsearch_replicas | int) // 2) + 1 }}
+
+  image: docker.elastic.co/elasticsearch/elasticsearch
+  imageTag: "{{ elastic_stack_version }}"
+  imagePullPolicy: IfNotPresent
+
+  esJavaOpts: "{{ elasticsearch_heap }}"
+
+  resources:
+    requests:
+      cpu: "{{ elasticsearch_resources.requests.cpu }}"
+      memory: "{{ elasticsearch_resources.requests.memory }}"
+    limits:
+      cpu: "{{ elasticsearch_resources.limits.cpu }}"
+      memory: "{{ elasticsearch_resources.limits.memory }}"
+
+  # ---- Persistence -------------------------------------------------------
+  # This is the PersistentVolumeClaim the brief requires. Without it a pod
+  # restart loses every indexed document, which defeats the purpose of
+  # centralizing logs at all.
+  persistence:
+    enabled: true
+    labels:
+      enabled: true
+
+  volumeClaimTemplate:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: "{{ storage_class }}"
+    resources:
+      requests:
+        storage: "{{ elasticsearch_storage_size }}"
+
+  # ---- Security ----------------------------------------------------------
+  # secret.enabled: false because Ansible already created
+  # `{{ elastic_credentials_secret }}`. Letting the chart generate its own
+  # password would mean Logstash, Kibana and the smoke test all read a
+  # credential nobody else knows.
+  secret:
+    enabled: false
+
+  createCert: {{ 'false' if is_emulated else 'true' }}
+  protocol: "{{ elasticsearch_protocol }}"
+  httpPort: {{ elasticsearch_port }}
+  transportPort: {{ elasticsearch_transport_port }}
+
+  extraEnvs:
+    - name: ELASTIC_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: "{{ elastic_credentials_secret }}"
+          key: password
+    - name: ELASTIC_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: "{{ elastic_credentials_secret }}"
+          key: username
+    - name: ELASTICSEARCH_YML_XPACK_SECURITY_HTTP_SSL_ENABLED
+      value: "false"
+
+  esConfig:
+    elasticsearch.yml: |
+      cluster.name: "{{ elasticsearch_cluster_name }}"
+      network.host: 0.0.0.0
+      xpack.security.enabled: true
+      xpack.security.autoconfiguration.enabled: false
+      xpack.security.enrollment.enabled: false
+      xpack.security.http.ssl.enabled: false
+      xpack.monitoring.collection.enabled: true
+      xpack.ml.enabled: false
+      {% if is_emulated | bool %}
+      # --- Local Environment (Docker/Floci) ---
+      # One replica, so nothing needs to reach port 9300. Keeping the transport
+      # on loopback makes Elasticsearch run in development mode, where the
+      # "transport SSL must be enabled" bootstrap check is only a warning.
+      # HTTP (9200) still listens on 0.0.0.0 for Kibana/Logstash.
+      transport.host: 127.0.0.1
+      xpack.security.transport.ssl.enabled: false
+      {% else %}
+      # --- Cloud Environment (GCP/GKE) ---
+      xpack.security.transport.ssl.enabled: true
+      {% endif %}
+
+{% if is_emulated | bool %}
+  # One k3s node cannot satisfy anti-affinity, and the single replica has no
+  # peer to be anti-affine to anyway.
+  antiAffinity: "soft"
+  clusterHealthCheckParams: "wait_for_status=yellow&timeout=60s"
+{% else %}
+  antiAffinity: "hard"
+  clusterHealthCheckParams: "wait_for_status=green&timeout=120s"
+{% endif %}
+  # Elasticsearch refuses to start if vm.max_map_count < 262144. On GKE's COS
+  # image the sysctl must be raised by a privileged init container.
+  sysctlInitContainer:
+    enabled: true
+  sysctlVmMaxMapCount: 262144
+
+  readinessProbe:
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 10
+    successThreshold: 1
+
+  service:
+    type: ClusterIP
+    httpPortName: http
+    transportPortName: transport
+
+  podSecurityContext:
+    fsGroup: 1000
+    runAsUser: 1000
+
+# ===========================================================================
+# 2. LOGSTASH - Deployment + ClusterIP Service on 5044
+#
+# The heart of the logging pipeline: input -> filter -> output.
+# ===========================================================================
+logstash:
+  fullnameOverride: "{{ logstash_service }}"
+
+  replicas: {{ logstash_replicas }}
+
+  image: docker.elastic.co/logstash/logstash
+  imageTag: "{{ elastic_stack_version }}"
+  imagePullPolicy: IfNotPresent
+
+  logstashJavaOpts: "{{ logstash_heap }}"
+
+  resources:
+    requests:
+      cpu: "{{ logstash_resources.requests.cpu }}"
+      memory: "{{ logstash_resources.requests.memory }}"
+    limits:
+      cpu: "{{ logstash_resources.limits.cpu }}"
+      memory: "{{ logstash_resources.limits.memory }}"
+
+  extraEnvs:
+    - name: ELASTICSEARCH_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: logstash-es-credentials
+          key: username
+    - name: ELASTICSEARCH_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: logstash-es-credentials
+          key: password
+
+  # ---- Service: this is what Filebeat ships to --------------------------
+  service:
+    type: ClusterIP
+    ports:
+      - name: beats
+        port: {{ logstash_beats_port }}
+        protocol: TCP
+        targetPort: {{ logstash_beats_port }}
+      - name: http
+        port: {{ logstash_http_port }}
+        protocol: TCP
+        targetPort: {{ logstash_http_port }}
+
+  # A small persistent queue absorbs Elasticsearch restarts without dropping
+  # log lines on the floor.
+  persistence:
+    enabled: true
+
+  volumeClaimTemplate:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: "{{ storage_class }}"
+    resources:
+      requests:
+        storage: "{{ logstash_storage_size }}"
+
+  logstashConfig:
+    logstash.yml: |
+      http.host: "0.0.0.0"
+      http.port: {{ logstash_http_port }}
+      pipeline.workers: 2
+      pipeline.batch.size: 250
+      pipeline.batch.delay: 50
+      # Disk-backed queue: survives a pod restart mid-flight.
+      queue.type: persisted
+      queue.max_bytes: 1gb
+      log.level: info
+
+  logstashPipeline:
+    logstash.conf: |
+      # =================================================================
+      # INPUT - Beats protocol. Filebeat DaemonSets connect here on 5044.
+      # =================================================================
+      input {
+        beats {
+          port => {{ logstash_beats_port }}
+          client_inactivity_timeout => 300
+        }
+      }
+
+      # =================================================================
+      # FILTER - turn one opaque text line into typed, queryable fields.
+      # =================================================================
+      filter {
+
+        # Keep a verbatim copy BEFORE any mutation. If a grok pattern fails
+        # we still want the original line searchable rather than lost.
+        mutate {
+          add_field => { "raw_message" => "%{message}" }
+        }
+
+        # ---- NGINX access logs ----------------------------------------
+        # Combined log format:
+        #   10.1.2.3 - - [12/Nov/2026:08:15:42 +0000] "GET /path HTTP/1.1" 200 612 "-" "curl/8.4.0"
+        if [kubernetes][container][name] == "nginx"
+           or [kubernetes][labels][app] == "nginx-demo"
+           or [message] =~ /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} - / {
+
+          grok {
+            match => {
+              "message" => [
+                "%{IPORHOST:client_ip} - %{DATA:remote_user} \[%{HTTPDATE:timestamp}\] \"%{WORD:http_method} %{DATA:request_path} HTTP/%{NUMBER:http_version}\" %{NUMBER:http_status:int} %{NUMBER:bytes_sent:int} \"%{DATA:http_referer}\" \"%{DATA:user_agent}\"( \"%{DATA:x_forwarded_for}\")?",
+                "%{IPORHOST:client_ip} - %{DATA:remote_user} \[%{HTTPDATE:timestamp}\] \"%{WORD:http_method} %{DATA:request_path} HTTP/%{NUMBER:http_version}\" %{NUMBER:http_status:int} %{NUMBER:bytes_sent:int}"
+              ]
+            }
+            tag_on_failure => ["_grok_nginx_access_failure"]
+          }
+
+          # ---- NGINX error logs ---------------------------------------
+          if "_grok_nginx_access_failure" in [tags] {
+            grok {
+              match => {
+                "message" => "%{DATESTAMP:timestamp} \[%{LOGLEVEL:log_level}\] %{POSINT:pid}#%{NUMBER:tid}: %{GREEDYDATA:error_detail}"
+              }
+              tag_on_failure => ["_grok_nginx_error_failure"]
+            }
+          }
+
+          # Normalise the event timestamp to the one IN the log line, not
+          # the time Filebeat happened to read it. Without this, a backlog
+          # replay would stack every old line onto "now".
+          if [timestamp] {
+            date {
+              match => [
+                "timestamp",
+                "dd/MMM/yyyy:HH:mm:ss Z",
+                "yy/MM/dd HH:mm:ss",
+                "ISO8601"
+              ]
+              target => "@timestamp"
+              tag_on_failure => ["_dateparsefailure"]
+            }
+          }
+
+          # Derive a log_level from the status class so NGINX access lines
+          # are filterable next to application logs in the same Kibana view.
+          if [http_status] {
+            if [http_status] >= 500 {
+              mutate { add_field => { "log_level" => "ERROR" } }
+            } else if [http_status] >= 400 {
+              mutate { add_field => { "log_level" => "WARN" } }
+            } else {
+              mutate { add_field => { "log_level" => "INFO" } }
+            }
+          }
+
+          # Split /path?a=1 so the path is a clean aggregation key.
+          if [request_path] {
+            grok {
+              match => { "request_path" => "%{URIPATH:request_uri}(?:%{URIPARAM:request_params})?" }
+              tag_on_failure => []
+            }
+          }
+        }
+
+        # ---- Generic application logs ---------------------------------
+        # Anything that is not NGINX: pull out a severity so dashboards can
+        # count ERROR/WARN across every microservice uniformly.
+        else {
+          grok {
+            match => {
+              "message" => [
+                "%{TIMESTAMP_ISO8601:timestamp}%{SPACE}\[?%{LOGLEVEL:log_level}\]?%{SPACE}%{GREEDYDATA:log_detail}",
+                "%{LOGLEVEL:log_level}%{SPACE}%{GREEDYDATA:log_detail}"
+              ]
+            }
+            tag_on_failure => ["_grok_app_failure"]
+          }
+
+          if [timestamp] {
+            date {
+              match => ["timestamp", "ISO8601", "yyyy-MM-dd HH:mm:ss,SSS", "yyyy-MM-dd HH:mm:ss"]
+              target => "@timestamp"
+              tag_on_failure => ["_dateparsefailure"]
+            }
+          }
+
+          # Unparsed lines still get a level so no document is untyped.
+          if ![log_level] {
+            mutate { add_field => { "log_level" => "INFO" } }
+          }
+        }
+
+        # ---- Normalisation applied to every event ---------------------
+        mutate {
+          uppercase => ["log_level"]
+          # Flatten the Kubernetes metadata Filebeat attached into short,
+          # memorable field names. Kibana users should not have to type
+          # kubernetes.pod.name five levels deep.
+          rename => {
+            "[kubernetes][pod][name]"       => "[kubernetes][pod]"
+            "[kubernetes][namespace]"       => "[kubernetes][namespace]"
+            "[kubernetes][container][name]" => "[kubernetes][container]"
+            "[kubernetes][node][name]"      => "[kubernetes][node]"
+          }
+          remove_field => ["agent", "ecs", "input", "stream", "host"]
+        }
+
+        # Index-routing metadata: one index per day keeps shards small and
+        # makes retention a matter of deleting whole indices.
+        mutate {
+          add_field => {
+            "[@metadata][index_prefix]" => "{{ logstash_index_pattern }}"
+          }
+        }
+      }
+
+      # =================================================================
+      # OUTPUT - structured JSON documents into Elasticsearch over 9200.
+      # =================================================================
+      output {
+        elasticsearch {
+          hosts  => ["{{ elasticsearch_protocol }}://{{ elasticsearch_service }}.{{ logging_namespace }}.svc:{{ elasticsearch_port }}"]
+          user   => "${ELASTICSEARCH_USERNAME}"
+          password => "${ELASTICSEARCH_PASSWORD}"
+          index  => "{{ logstash_index_pattern }}-%{+YYYY.MM.dd}"
+{% if elasticsearch_tls_enabled | bool %}
+          ssl => true
+          ssl_verification_mode => "full"
+{% else %}
+          ssl => false
+{% endif %}
+          # An explicit template so http_status is a long and client_ip is an
+          # ip, not a string. Without it Kibana cannot do range filters or
+          # geo lookups on them.
+          manage_template => true
+          template_name => "{{ logstash_index_pattern }}"
+          template_overwrite => true
+          action => "create"
+          data_stream => false
+        }
+
+{% if is_emulated | bool %}
+        # Local only: mirrors every document to the pod log so a failing
+        # pipeline can be debugged with `kubectl logs` and no Kibana.
+        stdout { codec => rubydebug { metadata => false } }
+{% endif %}
+      }
+
+# ===========================================================================
+# 3. KIBANA - Deployment + Service on 5601
+# ===========================================================================
+kibana:
+  elasticsearchSecurity:
+    auth:
+      useServiceAccountToken: {{ 'true' if elasticsearch_tls_enabled else 'false' }}
+  elasticsearchHosts: "{{ elasticsearch_protocol }}://{{ elasticsearch_service }}.{{ logging_namespace }}.svc:{{ elasticsearch_port }}"
+
+  replicas: {{ kibana_replicas }}
+
+  image: docker.elastic.co/kibana/kibana
+  imageTag: "{{ elastic_stack_version }}"
+  imagePullPolicy: IfNotPresent
+
+  protocol: http
+  httpPort: {{ kibana_port }}
+
+  # Credentials come from the Ansible-created Secret, never from values.
+  extraEnvs:
+    - name: ELASTICSEARCH_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: "{{ kibana_credentials_secret }}"
+          key: username
+    - name: ELASTICSEARCH_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: "{{ kibana_credentials_secret }}"
+          key: password
+    - name: KIBANA_ENCRYPTION_KEY
+      valueFrom:
+        secretKeyRef:
+          name: "{{ kibana_credentials_secret }}"
+          key: encryptionkey
+    - name: NODE_OPTIONS
+      value: "--max-old-space-size=512"
+
+  kibanaConfig:
+    kibana.yml: |
+      server.name: kibana
+      server.host: "0.0.0.0"
+      server.publicBaseUrl: "http://localhost:{{ kibana_port }}"
+      elasticsearch.hosts: ["{{ elasticsearch_protocol }}://{{ elasticsearch_service }}.{{ logging_namespace }}.svc:{{ elasticsearch_port }}"]
+      elasticsearch.username: "${ELASTICSEARCH_USERNAME}"
+      elasticsearch.password: "${ELASTICSEARCH_PASSWORD}"
+      elasticsearch.requestTimeout: 90000
+      # Stable key: regenerating it on every restart orphans saved objects.
+      xpack.encryptedSavedObjects.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"
+      xpack.reporting.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"
+      xpack.security.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"
+      monitoring.ui.container.elasticsearch.enabled: true
+
+  resources:
+    requests:
+      cpu: "{{ '100m' if is_emulated else '500m' }}"
+      memory: "{{ '512Mi' if is_emulated else '2Gi' }}"
+    limits:
+      cpu: "{{ '1000m' if is_emulated else '2000m' }}"
+      memory: "{{ '2Gi' if is_emulated else '4Gi' }}"
+
+  service:
+    type: ClusterIP
+    port: {{ kibana_port }}
+
+  healthCheckPath: "/app/kibana"
+
+  readinessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 10
+    failureThreshold: 30
+    successThreshold: 1
+
+# ===========================================================================
+# 4. FILEBEAT - DaemonSet, exactly one pod per node
+# ===========================================================================
+filebeat:
+  daemonset:
+    enabled: true
+    {% if elasticsearch_tls_enabled | bool %}
+      secretMounts:
+        - name: elasticsearch-master-certs
+          secretName: elasticsearch-master-certs
+          path: /usr/share/filebeat/certs/
+      {% endif %}
+
+    # Use the ServiceAccount Ansible created and bound to obs-cluster-reader,
+    # instead of letting the chart invent its own RBAC.
+    annotations: {}
+    labels:
+      app.kubernetes.io/part-of: elk
+
+    resources:
+      requests:
+        cpu: "{{ filebeat_resources.requests.cpu }}"
+        memory: "{{ filebeat_resources.requests.memory }}"
+      limits:
+        cpu: "{{ filebeat_resources.limits.cpu }}"
+        memory: "{{ filebeat_resources.limits.memory }}"
+
+    # Filebeat must read the node's log directory, which is root-owned.
+    securityContext:
+      runAsUser: 0
+      privileged: false
+
+    extraEnvs:
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
+      - name: POD_NAMESPACE
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.namespace
+
+    # hostPath mounts: this is how a container reads the node's disk.
+    # /var/log/containers holds symlinks into /var/log/pods, so BOTH are
+    # required - mounting only the first yields dangling symlinks.
+    extraVolumes:
+      - name: varlogcontainers
+        hostPath:
+          path: /var/log/containers
+          type: DirectoryOrCreate
+      - name: varlogpods
+        hostPath:
+          path: /var/log/pods
+          type: DirectoryOrCreate
+
+    extraVolumeMounts:
+      - name: varlogcontainers
+        mountPath: /var/log/containers
+        readOnly: true
+      - name: varlogpods
+        mountPath: /var/log/pods
+        readOnly: true
+    # Tolerate control-plane taints so the DaemonSet really is on EVERY node.
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+
+    filebeatConfig:
+      filebeat.yml: |
+        # ---- INPUT: tail every container log file on this node ----------
+        filebeat.inputs:
+          - type: container
+            enabled: true
+            paths:
+              - /var/log/containers/*.log
+            # Containerd/CRI writes partial lines when output exceeds 16KB.
+            parsers:
+              - container:
+                  stream: all
+                  format: auto
+            processors:
+              # Attach pod name, namespace, labels, node. This is what makes
+              # a log line attributable to a workload instead of to a file.
+              - add_kubernetes_metadata:
+                  host: "${NODE_NAME}"
+                  default_indexers.enabled: true
+                  default_matchers.enabled: true
+                  matchers:
+                    - logs_path:
+                        logs_path: "/var/log/containers/"
+              # Never ship our own pipeline's logs back into the pipeline.
+              - drop_event:
+                  when:
+                    or:
+                      - equals:
+                          kubernetes.namespace: "{{ logging_namespace }}"
+                      - equals:
+                          kubernetes.namespace: "kube-system"
+            # Multiline: fold Java/Python stack traces into one event rather
+            # than 40 orphaned lines.
+            multiline:
+              type: pattern
+              pattern: '^[[:space:]]+(at|\.{3})[[:space:]]+\b|^Caused by:'
+              negate: false
+              match: after
+              max_lines: 500
+              timeout: 5s
+
+        # ---- PROCESSORS applied to every event --------------------------
+        processors:
+          - add_host_metadata:
+              when.not.contains.tags: forwarded
+          - add_cloud_metadata: ~
+          - add_fields:
+              target: ''
+              fields:
+                cluster: "{{ cluster_name | default('obs-gke') }}"
+                environment: "{{ environment_name }}"
+
+        # ---- OUTPUT: Logstash over the beats protocol on 5044 -----------
+        # NOT straight to Elasticsearch: the whole point of the Logstash hop
+        # is Grok parsing. Bypassing it would store opaque text blobs.
+        output.logstash:
+          hosts: ["{{ logstash_service }}.{{ logging_namespace }}.svc:{{ logstash_beats_port }}"]
+          loadbalance: true
+          # Back-pressure settings: retry forever rather than drop logs.
+          max_retries: -1
+          bulk_max_size: 2048
+          slow_start: true
+          ttl: 30s
+
+        # Filebeat's own health, visible via `kubectl logs`.
+        logging.level: info
+        logging.to_files: false
+
+        http.enabled: true
+        http.host: 0.0.0.0
+        http.port: 5066
+
+  # The chart would otherwise create a second, competing ServiceAccount and
+  # ClusterRole. Ansible owns those (see the RBAC tasks in playbook.yml).
+  managedServiceAccount: false
+  serviceAccount: "{{ filebeat_service_account }}"
+
+  # One Filebeat per node is enough; the Deployment variant would duplicate
+  # every log line.
+  deployment:
+    enabled: false
+
+  image: docker.elastic.co/beats/filebeat
+  imageTag: "{{ elastic_stack_version }}"
+  imagePullPolicy: IfNotPresent

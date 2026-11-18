@@ -1,0 +1,28 @@
+---
+# Install with:  ansible-galaxy install -r requirements.yml
+# (the Makefile `galaxy` target does this before every deploy)
+
+collections:
+  # Provides k8s, k8s_info, helm, helm_repository, k8s_exec and the
+  # kubernetes.core.k8s inventory plugin. Everything in playbook.yml is
+  # built on this.
+  - name: kubernetes.core
+    version: ">=3.0.0,<6.0.0"
+
+  # community.general supplies the `to_uuid`/filter helpers and the
+  # `community.general.random_string` lookup used for password generation.
+  - name: community.general
+    version: ">=8.0.0"
+
+  # ansible.posix provides the `ansible.posix.synchronize` and sysctl
+  # helpers used when running the playbook against bare nodes.
+  - name: ansible.posix
+    version: ">=1.5.0"
+
+roles: []
+
+# Python dependencies (install into the same interpreter Ansible uses):
+#   pip install "kubernetes>=28.1.0" "PyYAML>=6.0" "jsonpatch>=1.33"
+# The kubernetes.core modules import the official Kubernetes Python client;
+# without it every task fails with "Failed to import the required Python
+# library (kubernetes)".

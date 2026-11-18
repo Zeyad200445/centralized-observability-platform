@@ -1,0 +1,635 @@
+---
+# ===========================================================================
+# Centralized Observability Platform - configuration layer.
+#
+# Runs AFTER terraform apply. Consumes the kubeconfig Terraform produced and
+# builds, in order:
+#
+#   1. three isolated namespaces          (workload / logging / monitoring)
+#   2. Kubernetes Secrets from Jinja2     (Elasticsearch, Kibana, Grafana)
+#   3. ServiceAccounts + RBAC             (Prometheus, Filebeat, GCP exporter)
+#   4. the ELK logging pipeline           (Helm, tag: logging)
+#   5. the Prometheus/Grafana pipeline    (Helm, tag: monitoring)
+#   6. the GCP Stackdriver exporter       (raw manifests, tag: monitoring)
+#
+# Every task is idempotent: re-running changes nothing unless a variable or
+# template changed.
+#
+#   ansible-playbook -i inventory/hosts.ini playbook.yml
+#   ansible-playbook -i inventory/hosts.ini playbook.yml --tags logging
+#   ansible-playbook -i inventory/hosts.ini playbook.yml --check --diff
+# ===========================================================================
+
+- name: Deploy the centralized observability platform
+  hosts: control
+  gather_facts: false
+  connection: local
+
+  vars:
+    # Shared argument block so no task forgets the kubeconfig.
+    k8s_auth: &k8s_auth
+      kubeconfig: "{{ kubeconfig_path }}"
+      context: "{{ kube_context | default(omit, true) }}"
+
+  # =======================================================================
+  # PRE-FLIGHT
+  # =======================================================================
+  pre_tasks:
+
+    - name: Pre-flight | Assert the kubeconfig exists
+      ansible.builtin.stat:
+        path: "{{ kubeconfig_path }}"
+      register: kubeconfig_stat
+      tags: [always]
+
+    - name: Pre-flight | Fail early with an actionable message
+      ansible.builtin.fail:
+        msg: >-
+          kubeconfig not found at {{ kubeconfig_path }}.
+          Run `make local-apply && make kubeconfig` (local) or
+          `make gcp-apply && make gcp-kubeconfig` (cloud) first.
+      when: not kubeconfig_stat.stat.exists
+      tags: [always]
+
+    - name: Pre-flight | Verify the Kubernetes Python client is importable
+      ansible.builtin.command:
+        cmd: "{{ ansible_playbook_python }} -c 'import kubernetes'"
+      changed_when: false
+      failed_when: false
+      register: k8s_client_check
+      tags: [always]
+
+    - name: Pre-flight | Explain the missing dependency
+      ansible.builtin.fail:
+        msg: >-
+          The `kubernetes` Python library is required by kubernetes.core.
+          Install it into {{ ansible_playbook_python }}:
+          pip install "kubernetes>=28.1.0" PyYAML jsonpatch
+      when: k8s_client_check.rc != 0
+      tags: [always]
+
+    # Terraform is the authority on infrastructure facts. Reading them here
+    # removes the only realistic source of drift between the two layers:
+    # a hand-copied service account email.
+    - name: Pre-flight | Read Terraform outputs
+      ansible.builtin.command:
+        cmd: terraform -chdir={{ terraform_env_dir }} output -json ansible_facts
+      register: tf_output
+      changed_when: false
+      failed_when: false
+      when: terraform_outputs_enabled | bool
+      tags: [always]
+
+    - name: Pre-flight | Adopt Terraform facts when available
+      ansible.builtin.set_fact:
+        tf_facts: "{{ tf_output.stdout | from_json }}"
+      when:
+        - terraform_outputs_enabled | bool
+        - tf_output.rc is defined and tf_output.rc == 0
+        - tf_output.stdout | default('') | length > 0
+      tags: [always]
+
+    - name: Pre-flight | Override variables from Terraform
+      ansible.builtin.set_fact:
+        gcp_project_id: "{{ tf_facts.project_id | default(gcp_project_id) }}"
+        gcp_region: "{{ tf_facts.region | default(gcp_region) }}"
+        is_emulated: "{{ tf_facts.emulated | default(is_emulated) }}"
+        gcp_exporter_sa_email: "{{ tf_facts.gcp_exporter_sa_email | default(gcp_exporter_sa_email) }}"
+        gcp_exporter_k8s_sa: "{{ tf_facts.gcp_exporter_k8s_sa_name | default(gcp_exporter_k8s_sa) }}"
+        monitoring_namespace: "{{ tf_facts.gcp_exporter_k8s_namespace | default(monitoring_namespace) }}"
+        cluster_name: "{{ tf_facts.cluster_name | default('obs-gke') }}"
+      when: tf_facts is defined
+      tags: [always]
+
+    - name: Pre-flight | Warn when falling back to group_vars
+      ansible.builtin.debug:
+        msg: >-
+          Could not read Terraform outputs from {{ terraform_env_dir }}.
+          Falling back to group_vars/all.yml. The GCP exporter will use
+          {{ gcp_exporter_sa_email }} - verify this matches reality.
+      when: tf_facts is not defined
+      tags: [always]
+
+    - name: Pre-flight | Confirm the cluster is reachable
+      kubernetes.core.k8s_info:
+        <<: *k8s_auth
+        kind: Node
+      register: cluster_nodes
+      retries: 10
+      delay: 10
+      until: cluster_nodes.resources | default([]) | length > 0
+      tags: [always]
+
+    - name: Pre-flight | Report cluster topology
+      ansible.builtin.debug:
+        msg: >-
+          Connected to {{ cluster_name | default('cluster') }}:
+          {{ cluster_nodes.resources | length }} node(s),
+          environment={{ environment_name }},
+          emulated={{ is_emulated }},
+          storageClass={{ storage_class }}
+      tags: [always]
+
+    - name: Pre-flight | Ensure the render directory exists
+      ansible.builtin.file:
+        path: "{{ rendered_dir }}"
+        state: directory
+        mode: "0750"
+      tags: [always]
+
+  # =======================================================================
+  # TASKS
+  # =======================================================================
+  tasks:
+
+    # ---------------------------------------------------------------- 1
+    # NAMESPACE ISOLATION
+    #
+    # Three namespaces give three independent RBAC, quota and NetworkPolicy
+    # boundaries. A noisy application in `workload` cannot evict Prometheus,
+    # and an Elasticsearch compromise is contained to `logging`.
+    # ---------------------------------------------------------------- 1
+    - name: Namespaces | Create the three isolated namespaces
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item.name }}"
+            labels:
+              name: "{{ item.name }}"
+              platform: centralized-observability
+              managed-by: ansible
+              # Lets Filebeat/Prometheus select by purpose rather than by name.
+              observability-role: "{{ item.name }}"
+            annotations:
+              platform.observability/purpose: "{{ item.purpose }}"
+      loop: "{{ namespaces }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [always, namespaces]
+
+    - name: Namespaces | Apply a ResourceQuota to the workload namespace
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: workload-quota
+            namespace: "{{ workload_namespace }}"
+          spec:
+            hard:
+              requests.cpu: "{{ '2' if is_emulated else '16' }}"
+              requests.memory: "{{ '4Gi' if is_emulated else '32Gi' }}"
+              limits.cpu: "{{ '4' if is_emulated else '32' }}"
+              limits.memory: "{{ '8Gi' if is_emulated else '64Gi' }}"
+              pods: "{{ '20' if is_emulated else '100' }}"
+      tags: [namespaces, quota]
+
+    # ---------------------------------------------------------------- 2
+    # SECRETS
+    #
+    # Rendered from group_vars through Jinja2 and base64-encoded by the
+    # `b64encode` filter. `data:` is used rather than `stringData:` so the
+    # encoding is explicit and matches what the brief asked for.
+    #
+    # no_log: true keeps the plaintext out of the Ansible console and out of
+    # any CI log aggregator.
+    # ---------------------------------------------------------------- 2
+    - name: Secrets | Elasticsearch credentials
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: "{{ elastic_credentials_secret }}"
+            namespace: "{{ logging_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: elk
+              managed-by: ansible
+          data:
+            username: "{{ elastic_username | b64encode }}"
+            password: "{{ vault_elastic_password | b64encode }}"
+            # The elastic Helm charts look for this exact key name.
+            elastic: "{{ vault_elastic_password | b64encode }}"
+      no_log: true
+      tags: [secrets, logging]
+
+    - name: Secrets | Kibana encryption key and Elasticsearch credentials
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: "{{ kibana_credentials_secret }}"
+            namespace: "{{ logging_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: elk
+              managed-by: ansible
+          data:
+            username: "{{ elastic_username | b64encode }}"
+            password: "{{ vault_elastic_password | b64encode }}"
+            # Kibana refuses to start saved-object encryption without a
+            # stable 32+ char key; a random one per restart would orphan
+            # every encrypted saved object.
+            encryptionkey: "{{ vault_kibana_encryption_key | b64encode }}"
+      no_log: true
+      tags: [secrets, logging]
+
+    - name: Secrets | Grafana admin credentials
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: "{{ grafana_credentials_secret }}"
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: monitoring
+              managed-by: ansible
+          data:
+            # kube-prometheus-stack reads these two key names when
+            # grafana.admin.existingSecret is set.
+            admin-user: "{{ grafana_admin_user | b64encode }}"
+            admin-password: "{{ vault_grafana_admin_password | b64encode }}"
+      no_log: true
+      tags: [secrets, monitoring]
+
+    - name: Secrets | Logstash output credentials
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: logstash-es-credentials
+            namespace: "{{ logging_namespace }}"
+            labels:
+              app.kubernetes.io/part-of: elk
+              managed-by: ansible
+          data:
+            username: "{{ elastic_username | b64encode }}"
+            password: "{{ vault_elastic_password | b64encode }}"
+      no_log: true
+      tags: [secrets, logging]
+
+    # ---------------------------------------------------------------- 3
+    # SERVICE ACCOUNTS + RBAC
+    #
+    # The charts would create their own SAs and ClusterRoles. We disable that
+    # (managedServiceAccount: false / serviceAccount.create: false) and own
+    # the permissions here, so the blast radius of each component is visible
+    # in one file instead of buried in upstream chart defaults.
+    # ---------------------------------------------------------------- 3
+    - name: RBAC | ServiceAccount for Prometheus
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ prometheus_service_account }}"
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app.kubernetes.io/name: prometheus
+              managed-by: ansible
+      tags: [rbac, monitoring]
+
+    - name: RBAC | ServiceAccount for Filebeat
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ filebeat_service_account }}"
+            namespace: "{{ logging_namespace }}"
+            labels:
+              app.kubernetes.io/name: filebeat
+              managed-by: ansible
+      tags: [rbac, logging]
+
+    # The Workload Identity bridge. The annotation is what makes the GKE
+    # metadata server hand this pod a token for the GCP service account that
+    # modules/iam granted roles/monitoring.viewer to.
+    - name: RBAC | ServiceAccount for the GCP exporter (Workload Identity)
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: "{{ gcp_exporter_k8s_sa }}"
+            namespace: "{{ monitoring_namespace }}"
+            labels:
+              app.kubernetes.io/name: "{{ gcp_exporter_name }}"
+              managed-by: ansible
+            annotations: >-
+              {{
+                {'iam.gke.io/gcp-service-account': gcp_exporter_sa_email}
+                if not (is_emulated | bool) else {}
+              }}
+      tags: [rbac, monitoring, gcp]
+
+    - name: RBAC | ClusterRole granting read access to cluster objects
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: obs-cluster-reader
+            labels:
+              managed-by: ansible
+          rules:
+            # The core requirement from the brief.
+            - apiGroups: [""]
+              resources: "{{ rbac_core_resources }}"
+              verbs: "{{ rbac_verbs }}"
+            # Filebeat needs namespaces to enrich logs with metadata.
+            - apiGroups: [""]
+              resources: [namespaces, configmaps, secrets, events, persistentvolumes, persistentvolumeclaims]
+              verbs: [get, list, watch]
+            # Prometheus discovers targets behind Deployments/DaemonSets.
+            - apiGroups: ["apps"]
+              resources: [deployments, daemonsets, replicasets, statefulsets]
+              verbs: [get, list, watch]
+            - apiGroups: ["batch"]
+              resources: [jobs, cronjobs]
+              verbs: [get, list, watch]
+            - apiGroups: ["extensions", "networking.k8s.io"]
+              resources: [ingresses]
+              verbs: [get, list, watch]
+            - apiGroups: ["discovery.k8s.io"]
+              resources: [endpointslices]
+              verbs: [get, list, watch]
+            - apiGroups: ["metrics.k8s.io"]
+              resources: [nodes, pods]
+              verbs: [get, list, watch]
+            # Scraping /metrics and /metrics/cadvisor on the kubelet is a
+            # non-resource URL and must be granted separately.
+            - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+              verbs: [get]
+      tags: [rbac, logging, monitoring]
+
+    - name: RBAC | Bind the ClusterRole to Prometheus and Filebeat
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: obs-cluster-reader-binding
+            labels:
+              managed-by: ansible
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: obs-cluster-reader
+          subjects:
+            - kind: ServiceAccount
+              name: "{{ prometheus_service_account }}"
+              namespace: "{{ monitoring_namespace }}"
+            - kind: ServiceAccount
+              name: "{{ filebeat_service_account }}"
+              namespace: "{{ logging_namespace }}"
+      tags: [rbac, logging, monitoring]
+
+    # ---------------------------------------------------------------- 4
+    # HELM REPOSITORIES
+    # ---------------------------------------------------------------- 4
+    - name: Helm | Add the chart repositories
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+        state: present
+      loop: "{{ helm_repositories }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [helm, logging, monitoring]
+
+    # ---------------------------------------------------------------- 5
+    # ELK LOGGING PIPELINE
+    #
+    # One Jinja2 template produces the values for all four releases. It is
+    # rendered to disk first (auditable, diffable) and then loaded back as a
+    # dict so each release gets only its own sub-tree.
+    # ---------------------------------------------------------------- 5
+    - name: ELK | Render the Helm values from Jinja2
+      ansible.builtin.template:
+        src: elk-values.yml.j2
+        dest: "{{ rendered_dir }}/elk-values.yml"
+        mode: "0640"
+      tags: [logging, helm]
+
+    - name: ELK | Load the rendered values
+      ansible.builtin.set_fact:
+        elk_values: "{{ lookup('file', rendered_dir ~ '/elk-values.yml') | from_yaml }}"
+      tags: [logging, helm]
+
+    # Elasticsearch first: Kibana and Logstash both block on it being up.
+    - name: ELK | Deploy Elasticsearch (StatefulSet + PVC)
+      kubernetes.core.helm:
+        <<: *k8s_auth
+        name: "{{ elasticsearch_release }}"
+        chart_ref: elastic/elasticsearch
+        chart_version: "{{ elastic_stack_version }}"
+        release_namespace: "{{ logging_namespace }}"
+        create_namespace: false
+        release_values: "{{ elk_values.elasticsearch }}"
+        wait: "{{ helm_wait }}"
+        wait_timeout: "{{ helm_timeout }}"
+        atomic: false
+      tags: [logging, helm, elasticsearch]
+
+    - name: ELK | Wait for Elasticsearch to report Ready
+      kubernetes.core.k8s_info:
+        <<: *k8s_auth
+        kind: Pod
+        namespace: "{{ logging_namespace }}"
+        label_selectors:
+          - "app={{ elasticsearch_cluster_name }}-master"
+      register: es_pods
+      until: >-
+        es_pods.resources | default([]) | length > 0 and
+        (es_pods.resources
+          | map(attribute='status.containerStatuses', default=[])
+          | flatten
+          | selectattr('ready', 'equalto', true)
+          | list | length) >= (elasticsearch_replicas | int)
+      retries: 40
+      delay: 15
+      tags: [logging, elasticsearch]
+
+    - name: ELK | Deploy Logstash (Deployment + ClusterIP on 5044)
+      kubernetes.core.helm:
+        <<: *k8s_auth
+        name: "{{ logstash_release }}"
+        chart_ref: elastic/logstash
+        chart_version: "{{ elastic_stack_version }}"
+        release_namespace: "{{ logging_namespace }}"
+        create_namespace: false
+        release_values: "{{ elk_values.logstash }}"
+        wait: "{{ helm_wait }}"
+        wait_timeout: "{{ helm_timeout }}"
+      tags: [logging, helm, logstash]
+
+    - name: ELK | Deploy Kibana (Deployment + Service on 5601)
+      kubernetes.core.helm:
+        <<: *k8s_auth
+        name: "{{ kibana_release }}"
+        chart_ref: elastic/kibana
+        chart_version: "{{ elastic_stack_version }}"
+        release_namespace: "{{ logging_namespace }}"
+        create_namespace: false
+        release_values: "{{ elk_values.kibana }}"
+        wait: "{{ helm_wait }}"
+        wait_timeout: "{{ helm_timeout }}"
+      tags: [logging, helm, kibana]
+
+    # Filebeat last: shipping into a Logstash that is not listening yet just
+    # fills the DaemonSet logs with connection refused.
+    - name: ELK | Deploy Filebeat (DaemonSet, one pod per node)
+      kubernetes.core.helm:
+        <<: *k8s_auth
+        name: "{{ filebeat_release }}"
+        chart_ref: elastic/filebeat
+        chart_version: "{{ elastic_stack_version }}"
+        release_namespace: "{{ logging_namespace }}"
+        create_namespace: false
+        release_values: "{{ elk_values.filebeat }}"
+        wait: "{{ helm_wait }}"
+        wait_timeout: "{{ helm_timeout }}"
+      tags: [logging, helm, filebeat]
+
+    # ---------------------------------------------------------------- 6
+    # METRICS PIPELINE
+    # ---------------------------------------------------------------- 6
+    - name: Monitoring | Render the kube-prometheus-stack values from Jinja2
+      ansible.builtin.template:
+        src: monitoring-values.yml.j2
+        dest: "{{ rendered_dir }}/monitoring-values.yml"
+        mode: "0640"
+      tags: [monitoring, helm]
+
+    - name: Monitoring | Deploy Prometheus, Grafana, Node Exporter and KSM
+      kubernetes.core.helm:
+        <<: *k8s_auth
+        name: "{{ kube_prometheus_release }}"
+        chart_ref: prometheus-community/kube-prometheus-stack
+        chart_version: "{{ kube_prometheus_stack_version }}"
+        release_namespace: "{{ monitoring_namespace }}"
+        create_namespace: false
+        values_files:
+          - "{{ rendered_dir }}/monitoring-values.yml"
+        wait: "{{ helm_wait }}"
+        wait_timeout: "{{ helm_timeout }}"
+        # The CRDs are large; Helm needs the extra headroom on first install.
+        disable_hook: false
+      tags: [monitoring, helm, prometheus]
+
+    # ---------------------------------------------------------------- 7
+    # GCP STACKDRIVER EXPORTER
+    #
+    # Raw manifests rather than a chart: the Workload Identity annotation,
+    # the ServiceMonitor and the dry-run behaviour under the emulator are all
+    # easier to express directly than by fighting chart defaults.
+    # ---------------------------------------------------------------- 7
+    - name: GCP Exporter | Render the manifests from Jinja2
+      ansible.builtin.template:
+        src: gcp-exporter.yml.j2
+        dest: "{{ rendered_dir }}/gcp-exporter.yml"
+        mode: "0640"
+      tags: [monitoring, gcp]
+
+    - name: GCP Exporter | Apply Deployment, Service and ServiceMonitor
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        apply: true
+        src: "{{ rendered_dir }}/gcp-exporter.yml"
+      tags: [monitoring, gcp]
+
+    # ---------------------------------------------------------------- 8
+    # VERIFICATION
+    # ---------------------------------------------------------------- 8
+    - name: Verify | Wait for the logging DaemonSet and Deployments
+      kubernetes.core.k8s_info:
+        <<: *k8s_auth
+        kind: Pod
+        namespace: "{{ logging_namespace }}"
+      register: logging_pods
+      until: >-
+        logging_pods.resources | default([]) | length > 0 and
+        (logging_pods.resources
+          | rejectattr('status.phase', 'equalto', 'Running')
+          | list | length) == 0
+      retries: 30
+      delay: 15
+      failed_when: false
+      tags: [verify, logging]
+
+    - name: Verify | Wait for the monitoring stack
+      kubernetes.core.k8s_info:
+        <<: *k8s_auth
+        kind: Pod
+        namespace: "{{ monitoring_namespace }}"
+      register: monitoring_pods
+      until: >-
+        monitoring_pods.resources | default([]) | length > 0 and
+        (monitoring_pods.resources
+          | rejectattr('status.phase', 'in', ['Running', 'Succeeded'])
+          | list | length) == 0
+      retries: 30
+      delay: 15
+      failed_when: false
+      tags: [verify, monitoring]
+
+  # =======================================================================
+  # SUMMARY
+  # =======================================================================
+  post_tasks:
+
+    - name: Summary | Platform endpoints
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================="
+          - "  Observability platform deployed ({{ environment_name }})"
+          - "=============================================================="
+          - "  Namespaces : {{ workload_namespace }}, {{ logging_namespace }}, {{ monitoring_namespace }}"
+          - ""
+          - "  Kibana     : kubectl -n {{ logging_namespace }} port-forward svc/{{ kibana_service }} {{ kibana_port }}:{{ kibana_port }}"
+          - "               http://localhost:{{ kibana_port }}  ({{ elastic_username }} / <elastic secret>)"
+          - "  Elastic    : kubectl -n {{ logging_namespace }} port-forward svc/{{ elasticsearch_service }} {{ elasticsearch_port }}:{{ elasticsearch_port }}"
+          - "  Logstash   : {{ logstash_service }}.{{ logging_namespace }}.svc:{{ logstash_beats_port }} (beats input)"
+          - ""
+          - "  Grafana    : kubectl -n {{ monitoring_namespace }} port-forward svc/{{ grafana_service }} {{ grafana_port }}:80"
+          - "               http://localhost:{{ grafana_port }}  ({{ grafana_admin_user }} / <grafana secret>)"
+          - "  Prometheus : kubectl -n {{ monitoring_namespace }} port-forward svc/{{ prometheus_service }} {{ prometheus_port }}:{{ prometheus_port }}"
+          - ""
+          - "  Index      : {{ logstash_index_pattern }}-YYYY.MM.dd"
+          - "  Scrape     : every {{ prometheus_scrape_interval }}"
+          - "  GCP SA     : {{ gcp_exporter_sa_email }}"
+          - "=============================================================="
+          - "  Next: make workload && make smoke"
+      tags: [always]

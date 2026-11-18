@@ -1,0 +1,75 @@
+# ===========================================================================
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   $EDITOR terraform.tfvars
+# ===========================================================================
+
+# --- required --------------------------------------------------------------
+project_id = "my-observability-project"
+
+# --- placement -------------------------------------------------------------
+region      = "us-central1"
+zone        = "us-central1-a"
+name_prefix = "obs"
+
+# --- API enablement --------------------------------------------------------
+# Set false if a central platform team already enables APIs for you.
+enable_apis = true
+
+# --- networking ------------------------------------------------------------
+# These must not overlap each other or any peered/on-prem range.
+subnet_cidr            = "10.10.0.0/20"
+pods_cidr              = "10.20.0.0/16"
+services_cidr          = "10.30.0.0/20"
+master_ipv4_cidr_block = "172.16.0.0/28"
+
+# Office / VPN egress CIDRs. Leave empty to create no admin firewall rule.
+authorized_source_ranges = [
+  # "203.0.113.10/32",
+]
+
+# Who may reach the Kubernetes API server. Empty means "anywhere", which you
+# should not ship; add your CI egress and VPN ranges.
+master_authorized_networks = [
+  # {
+  #   cidr_block   = "203.0.113.10/32"
+  #   display_name = "corp-vpn"
+  # },
+]
+
+enable_flow_logs = false
+
+# --- cluster ---------------------------------------------------------------
+kubernetes_version = ""         # "" = let the release channel choose
+release_channel    = "REGULAR"
+
+# e2-standard-4 is the practical floor: Elasticsearch alone wants 2 vCPU and
+# 4 GiB, and Prometheus, Grafana, Kibana and Logstash share the rest.
+machine_type = "e2-standard-4"
+disk_size_gb = 100
+
+enable_autoscaling = true
+min_node_count     = 3
+max_node_count     = 6
+node_count         = 3
+
+# Keep true in production so a stray `terraform destroy` cannot delete it.
+deletion_protection = true
+
+# --- IAM -------------------------------------------------------------------
+# Humans allowed to impersonate the read-only exporter SA when debugging.
+exporter_token_creators = [
+  # "user:sre@example.com",
+  # "group:platform-oncall@example.com",
+]
+
+# --- storage ---------------------------------------------------------------
+create_artifacts_bucket  = true
+artifacts_retention_days = 90
+
+# --- labels ----------------------------------------------------------------
+labels = {
+  owner       = "platform-team"
+  cost-centre = "observability"
+}

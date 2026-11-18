@@ -1,0 +1,460 @@
+# ===========================================================================
+# workloads/test-app.yaml
+#
+# The thing being observed. Deployed into the `workload` namespace, it exists
+# to prove both pipelines end to end:
+#
+#   LOGS    nginx writes access lines to stdout in a format the Logstash
+#           grok filter is written against. A load generator guarantees a
+#           steady mix of HTTP 200 and HTTP 404 so the parsed http_status
+#           field has more than one value to filter on. A second container
+#           emits levelled application logs so the generic (non-nginx) grok
+#           branch is exercised too.
+#
+#   METRICS nginx exposes stub_status, and a sidecar translates it into
+#           Prometheus format on :9113. The pod carries prometheus.io/*
+#           annotations, which the additionalScrapeConfigs block in
+#           monitoring-values.yml.j2 discovers automatically - no
+#           ServiceMonitor needed, and no change to the monitoring stack
+#           when a new app is added.
+#
+#   kubectl apply -f workloads/test-app.yaml
+# ===========================================================================
+---
+# The playbook creates this namespace, but declaring it here (idempotently)
+# means this file can also be applied standalone against a bare cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workload
+  labels:
+    name: workload
+    platform: centralized-observability
+    observability-role: workload
+
+---
+# ---------------------------------------------------------------------------
+# NGINX configuration.
+#
+# The log_format below is the contract between this workload and the Grok
+# pattern in elk-values.yml.j2. Changing one without the other is the single
+# most likely way to break the logging pipeline, so they are cross-referenced
+# in both files.
+#
+#   Emitted:  10.1.2.3 - - [12/Nov/2026:08:15:42 +0000] "GET /x HTTP/1.1" 404 153 "-" "curl/8.4.0" "-"
+#   Parsed:   client_ip  remote_user  timestamp  http_method request_path http_version http_status bytes_sent http_referer user_agent
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: workload
+  labels:
+    app: nginx-demo
+data:
+  nginx.conf: |
+    user  nginx;
+    worker_processes  auto;
+    error_log  /dev/stderr warn;
+    pid        /tmp/nginx.pid;
+
+    events {
+      worker_connections 1024;
+    }
+
+    http {
+      include       /etc/nginx/mime.types;
+      default_type  application/octet-stream;
+
+      # Combined log format, matched field-for-field by the Logstash grok.
+      log_format observability
+        '$remote_addr - $remote_user [$time_local] '
+        '"$request" $status $body_bytes_sent '
+        '"$http_referer" "$http_user_agent" "$http_x_forwarded_for"';
+
+      # stdout is the ONLY destination. The container runtime captures it
+      # into /var/log/pods, which is exactly what the Filebeat DaemonSet
+      # tails. Writing to a file inside the container would be invisible to
+      # the entire logging pipeline.
+      access_log /dev/stdout observability;
+
+      sendfile        on;
+      keepalive_timeout  65;
+
+      # Writable paths, because the container runs read-only-ish as non-root.
+      client_body_temp_path /tmp/client_body;
+      proxy_temp_path       /tmp/proxy;
+      fastcgi_temp_path     /tmp/fastcgi;
+      uwsgi_temp_path       /tmp/uwsgi;
+      scgi_temp_path        /tmp/scgi;
+
+      server {
+        listen 8080;
+        server_name _;
+        root /usr/share/nginx/html;
+
+        location / {
+          index index.html;
+        }
+
+        # Probe target that never 404s.
+        location = /healthz {
+          access_log off;
+          return 200 "ok\n";
+        }
+
+        # Deterministic 404 source for the smoke test.
+        location = /generate-404 {
+          return 404 "not found\n";
+        }
+
+        # Deterministic 500 source, so log_level=ERROR appears in Kibana.
+        location = /generate-500 {
+          return 500 "server error\n";
+        }
+
+        # Scraped by the sidecar exporter only; not exposed via the Service.
+        location = /stub_status {
+          stub_status;
+          access_log off;
+          allow 127.0.0.1;
+          deny all;
+        }
+      }
+    }
+
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+      <head><meta charset="utf-8"><title>Observability test workload</title></head>
+      <body>
+        <h1>Observability test workload</h1>
+        <p>Every request to this page produces one access log line that
+           travels: nginx stdout -&gt; /var/log/containers -&gt; Filebeat -&gt;
+           Logstash grok -&gt; Elasticsearch -&gt; Kibana.</p>
+        <ul>
+          <li><a href="/healthz">/healthz</a> - HTTP 200</li>
+          <li><a href="/generate-404">/generate-404</a> - HTTP 404</li>
+          <li><a href="/generate-500">/generate-500</a> - HTTP 500</li>
+        </ul>
+      </body>
+    </html>
+
+---
+# ---------------------------------------------------------------------------
+# NGINX Deployment + Prometheus exporter sidecar.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-demo
+  namespace: workload
+  labels:
+    app: nginx-demo
+    app.kubernetes.io/name: nginx-demo
+    app.kubernetes.io/component: web
+    platform: centralized-observability
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: nginx-demo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: nginx-demo
+        app.kubernetes.io/name: nginx-demo
+        app.kubernetes.io/component: web
+      annotations:
+        # Picked up by the kubernetes-pods-annotated scrape job defined in
+        # monitoring-values.yml.j2. This is the whole integration: an app
+        # opts into monitoring with three annotations.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9113"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101          # the nginx user in nginxinc images
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        # ---- the application --------------------------------------------
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: nginx-content
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+          # The workload namespace carries a ResourceQuota, so requests and
+          # limits are mandatory: without them the pod is rejected at admission.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 192Mi
+
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+        # ---- the metrics sidecar ----------------------------------------
+        # Translates nginx stub_status into Prometheus exposition format.
+        # Sidecar rather than a separate Deployment so it always scrapes the
+        # local nginx over 127.0.0.1 and can never be load-balanced to the
+        # wrong replica.
+        - name: nginx-exporter
+          image: nginx/nginx-prometheus-exporter:1.3.0
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - "--nginx.scrape-uri=http://127.0.0.1:8080/stub_status"
+            - "--web.listen-address=:9113"
+            - "--web.telemetry-path=/metrics"
+
+          ports:
+            - name: metrics
+              containerPort: 9113
+              protocol: TCP
+
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+          readinessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nginx-config
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+        - name: nginx-content
+          configMap:
+            name: nginx-config
+            items:
+              - key: index.html
+                path: index.html
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-demo
+  namespace: workload
+  labels:
+    app: nginx-demo
+    app.kubernetes.io/name: nginx-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx-demo
+  ports:
+    # Port 80 so `kubectl port-forward svc/nginx-demo 8080:80` in the smoke
+    # test reads naturally.
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9113
+      targetPort: metrics
+      protocol: TCP
+
+---
+# ---------------------------------------------------------------------------
+# Load generator.
+#
+# Without continuous traffic the logging pipeline has nothing to carry and
+# every Kibana screenshot is empty. This produces a predictable mix:
+#   ~60% HTTP 200, ~30% HTTP 404, ~10% HTTP 500
+# so http_status is a genuinely useful filter field rather than a constant.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  namespace: workload
+  labels:
+    app: load-generator
+    app.kubernetes.io/name: load-generator
+    app.kubernetes.io/component: traffic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: load-generator
+  template:
+    metadata:
+      labels:
+        app: load-generator
+        app.kubernetes.io/name: load-generator
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+      containers:
+        - name: curl
+          image: curlimages/curl:8.11.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "load-generator starting against http://nginx-demo.workload.svc"
+              BASE="http://nginx-demo.workload.svc"
+              i=0
+              while true; do
+                i=$((i + 1))
+                # 200s
+                curl -s -o /dev/null "$BASE/" || true
+                curl -s -o /dev/null "$BASE/healthz" || true
+                curl -s -o /dev/null "$BASE/index.html" || true
+                # 404s
+                curl -s -o /dev/null "$BASE/generate-404" || true
+                curl -s -o /dev/null "$BASE/missing/page-$i" || true
+                # 500 every tenth cycle
+                if [ $((i % 10)) -eq 0 ]; then
+                  curl -s -o /dev/null "$BASE/generate-500" || true
+                fi
+                sleep 5
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+---
+# ---------------------------------------------------------------------------
+# Application log emitter.
+#
+# NGINX only exercises the nginx branch of the Grok filter. This container
+# emits levelled, timestamped lines in a typical application format so the
+# generic branch - the one that extracts log_level from arbitrary services -
+# is proven too. It also deliberately emits a multi-line Java-style stack
+# trace so the Filebeat multiline config is exercised.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-logger
+  namespace: workload
+  labels:
+    app: app-logger
+    app.kubernetes.io/name: app-logger
+    app.kubernetes.io/component: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-logger
+  template:
+    metadata:
+      labels:
+        app: app-logger
+        app.kubernetes.io/name: app-logger
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+      containers:
+        - name: logger
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              n=0
+              while true; do
+                n=$((n + 1))
+                TS=$(date -u '+%Y-%m-%dT%H:%M:%S')
+                echo "$TS INFO  [order-service] processed order id=$n in 42ms"
+                echo "$TS DEBUG [order-service] cache hit ratio=0.91 queue_depth=3"
+                if [ $((n % 7)) -eq 0 ]; then
+                  echo "$TS WARN  [order-service] downstream latency above target: 850ms"
+                fi
+                if [ $((n % 13)) -eq 0 ]; then
+                  echo "$TS ERROR [order-service] payment gateway timeout for order id=$n"
+                  # Multi-line stack trace: Filebeat folds these continuation
+                  # lines into the single ERROR event above.
+                  echo "java.net.SocketTimeoutException: Read timed out"
+                  echo "    at java.base/java.net.SocketInputStream.read(SocketInputStream.java:168)"
+                  echo "    at com.example.payments.GatewayClient.charge(GatewayClient.java:88)"
+                  echo "Caused by: java.io.IOException: connection reset"
+                  echo "    at com.example.payments.GatewayClient.send(GatewayClient.java:142)"
+                fi
+                sleep 10
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

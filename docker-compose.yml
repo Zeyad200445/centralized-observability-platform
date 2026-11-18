@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Local GCP control plane for the Centralized Observability Platform.
+#
+# floci-gcp emulates the Google Cloud REST APIs that Terraform talks to
+# (compute, container/GKE, iam, storage, monitoring, serviceusage,
+# cloudresourcemanager) on a single ALPN-multiplexed port, 4588.
+#
+# The /var/run/docker.sock mount is NOT optional. GKE is one of floci-gcp's
+# "Docker-backed" services: when Terraform issues a
+# container.googleapis.com/v1 projects.locations.clusters.create call, the
+# emulator uses the host Docker Engine API to start a real rancher/k3s
+# container that becomes the cluster. Without the socket, cluster creation
+# degrades to a mock object with no reachable Kubernetes API server, and
+# every Ansible/Helm task downstream fails.
+# ---------------------------------------------------------------------------
+name: centralized-observability-platform
+
+services:
+  floci-gcp:
+    image: floci/floci-gcp:latest
+    container_name: floci-gcp
+    restart: unless-stopped
+    ports:
+      # REST + gRPC are multiplexed over this single port.
+      - "4588:4588"
+      # k3s API server published by the emulator-spawned cluster container.
+      - "6443:6443"
+    volumes:
+      # Docker-backed GKE: lets floci-gcp spawn the k3s cluster container.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Emulator state (projects, service accounts, networks, clusters).
+      - ./.floci/data:/app/data
+    environment:
+      # Hostname/base URL returned inside API responses. Must be the compose
+      # service name so that self-referencing links resolve from sidecars.
+      FLOCI_GCP_HOSTNAME: floci-gcp
+      FLOCI_GCP_BASE_URL: http://floci-gcp:4588
+      # Survive `docker compose restart` without losing Terraform's resources.
+      FLOCI_GCP_STORAGE_MODE: hybrid
+      # Must match var.project_id in terraform/environments/local.
+      FLOCI_GCP_DEFAULT_PROJECT_ID: obs-local
+      # Spawned sidecars (the k3s cluster) join this network so that the
+      # emulator and the cluster can talk to each other by container name.
+      FLOCI_GCP_SERVICES_DOCKER_NETWORK: centralized-observability-platform_observability
+      # Real k3s, not a mock. This is what makes `kubectl get nodes` work.
+      FLOCI_GCP_SERVICES_GKE_MOCK: "false"
+      FLOCI_GCP_SERVICES_GKE_DEFAULT_IMAGE: rancher/k3s:latest
+      # Prefix isolating our sidecar containers/volumes if several emulator
+      # instances share one Docker daemon (e.g. parallel CI jobs).
+      FLOCI_GCP_DOCKER_RESOURCE_NAMESPACE: obs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4588/_floci-gcp/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks:
+      - observability
+
+networks:
+  observability:
+    name: centralized-observability-platform_observability
+    driver: bridge

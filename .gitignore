@@ -1,0 +1,51 @@
+# ---- Terraform -------------------------------------------------------------
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Real variable values never belong in git; only the .example does.
+terraform.tfvars
+*.auto.tfvars
+!terraform.tfvars.example
+
+# ---- Emulator / local runtime ---------------------------------------------
+.floci/
+kubeconfig
+kubeconfig-*
+*.kubeconfig
+.kube/
+
+# ---- Ansible ---------------------------------------------------------------
+ansible/collections/
+ansible/*.retry
+ansible/rendered/
+*.log
+
+# ---- Secrets ---------------------------------------------------------------
+*.pem
+*.key
+*.p12
+sa-key*.json
+service-account*.json
+.env
+.env.*
+!.env.example
+vault-password*
+
+# ---- Editors / OS ----------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

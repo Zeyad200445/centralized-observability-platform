@@ -1,0 +1,217 @@
+---
+# ===========================================================================
+# group_vars/all.yml - single source of truth for the configuration layer.
+#
+# Everything the Jinja2 templates interpolate lives here. Terraform owns the
+# infrastructure facts (SA emails, cluster name); this file owns the
+# in-cluster facts (namespaces, versions, ports, credentials, sizing).
+#
+# SECRETS: the *_password values below are development defaults. For anything
+# shared, encrypt them:
+#
+#   ansible-vault encrypt_string 'S3cr3t!' --name 'vault_elastic_password'
+#
+# and move the resulting block into group_vars/vault.yml, then run with
+# --ask-vault-pass or --vault-password-file.
+# ===========================================================================
+
+# --- connection ------------------------------------------------------------
+# Overridden by the Makefile. Every kubernetes.core task consumes this.
+kubeconfig_path: "{{ playbook_dir }}/../.floci/kubeconfig"
+kube_context: ""
+
+# Read Terraform outputs so the exporter SA email is never hand-copied.
+terraform_outputs_enabled: true
+terraform_env_dir: "{{ playbook_dir }}/../terraform/environments/local"
+
+# --- environment shape -----------------------------------------------------
+# true  -> floci-gcp + k3s. Smaller replicas, local-path storage, no real
+#          Workload Identity, GCP exporter runs in dry-run mode.
+# false -> real GKE. Full replicas, PD storage, real Workload Identity.
+is_emulated: true
+environment_name: "{{ 'local' if is_emulated else 'gcp' }}"
+
+gcp_project_id: "obs-local"
+gcp_region: "us-central1"
+
+# --- namespaces ------------------------------------------------------------
+workload_namespace: workload
+logging_namespace: logging
+monitoring_namespace: monitoring
+
+namespaces:
+  - name: "{{ workload_namespace }}"
+    purpose: "Application microservices under observation"
+  - name: "{{ logging_namespace }}"
+    purpose: "ELK logging pipeline: Filebeat, Logstash, Elasticsearch, Kibana"
+  - name: "{{ monitoring_namespace }}"
+    purpose: "Metrics pipeline: Prometheus, Grafana, exporters"
+
+# --- storage ---------------------------------------------------------------
+# k3s ships local-path as its default provisioner; GKE ships standard-rwo.
+storage_class: "{{ 'local-path' if is_emulated else 'standard-rwo' }}"
+
+# --- Helm repositories -----------------------------------------------------
+helm_repositories:
+  - name: elastic
+    url: https://helm.elastic.co
+  - name: prometheus-community
+    url: https://prometheus-community.github.io/helm-charts
+  - name: grafana
+    url: https://grafana.github.io/helm-charts
+
+# --- chart / image versions ------------------------------------------------
+# Pinned, never "latest". An unpinned chart turns an idempotent playbook into
+# a time bomb that drifts the day upstream cuts a release.
+elastic_stack_version: "8.5.1"          # elastic/* chart AND image version
+kube_prometheus_stack_version: "65.5.1" # prometheus-community chart
+stackdriver_exporter_image: "prometheuscommunity/stackdriver-exporter:v0.18.0"
+
+# --- Elasticsearch ---------------------------------------------------------
+elasticsearch_release: elasticsearch
+elasticsearch_cluster_name: elasticsearch      # service becomes <name>-master
+elasticsearch_service: "elasticsearch-master"
+elasticsearch_port: 9200
+elasticsearch_transport_port: 9300
+elasticsearch_replicas: "{{ 1 if is_emulated else 3 }}"
+elasticsearch_storage_size: "{{ '10Gi' if is_emulated else '100Gi' }}"
+elasticsearch_heap: "{{ '-Xms256m -Xmx256m' if is_emulated else '-Xms2g -Xmx2g' }}"
+elasticsearch_resources:
+  requests:
+    cpu: "{{ '100m' if is_emulated else '1000m' }}"
+    memory: "{{ '512Mi' if is_emulated else '4Gi' }}"
+  limits:
+    cpu: "{{ '500m' if is_emulated else '2000m' }}"
+    memory: "{{ '1Gi' if is_emulated else '8Gi' }}"
+
+# Credentials injected as a Kubernetes Secret, never baked into values.
+elastic_username: elastic
+vault_elastic_password: "Obs3rv!Elastic2026"
+elastic_credentials_secret: elastic-credentials
+
+# TLS between the ELK components. Off locally so the stack boots on k3s
+# without a cert-manager dependency; on by default in the cloud.
+elasticsearch_tls_enabled: "{{ false if is_emulated else true }}"
+elasticsearch_protocol: "{{ 'http' if is_emulated else 'https' }}"
+
+# --- Kibana ----------------------------------------------------------------
+kibana_release: kibana
+kibana_service: "kibana-kibana"
+kibana_port: 5601
+kibana_replicas: 1
+vault_kibana_encryption_key: "a7f3c9e1b5d8426f0a2c4e6b8d1f3a5c7e9b0d2f4a6c8e1b3d5f7a9c0e2b4d6f"
+kibana_credentials_secret: kibana-credentials
+
+# --- Logstash --------------------------------------------------------------
+logstash_release: logstash
+logstash_service: logstash
+logstash_beats_port: 5044
+logstash_http_port: 9600
+logstash_replicas: "{{ 1 if is_emulated else 2 }}"
+logstash_heap: "{{ '-Xms256m -Xmx512m' if is_emulated else '-Xms1g -Xmx1g' }}"
+logstash_storage_size: 2Gi
+# Daily index pattern. The date maths runs inside Logstash, not Jinja.
+logstash_index_pattern: "logstash-k8s"
+logstash_resources:
+  requests:
+    cpu: "{{ '100m' if is_emulated else '500m' }}"
+    memory: "{{ '512Mi' if is_emulated else '2Gi' }}"
+  limits:
+    cpu: "{{ '500m' if is_emulated else '2000m' }}"
+    memory: "{{ '1Gi' if is_emulated else '3Gi' }}"
+
+# --- Filebeat --------------------------------------------------------------
+filebeat_release: filebeat
+filebeat_service_account: obs-filebeat
+# Host paths the DaemonSet mounts read-only to tail container stdout/stderr.
+filebeat_log_paths:
+  - /var/log/containers
+  - /var/log/pods
+filebeat_resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# --- Prometheus / Grafana --------------------------------------------------
+kube_prometheus_release: kube-prometheus-stack
+prometheus_service: "kube-prometheus-stack-prometheus"
+prometheus_port: 9090
+prometheus_service_account: obs-prometheus
+prometheus_scrape_interval: 15s          # required by the brief
+prometheus_evaluation_interval: 30s
+prometheus_retention: "{{ '2d' if is_emulated else '15d' }}"
+prometheus_storage_size: "{{ '10Gi' if is_emulated else '100Gi' }}"
+prometheus_replicas: 1
+prometheus_resources:
+  requests:
+    cpu: "{{ '100m' if is_emulated else '1000m' }}"
+    memory: "{{ '256Mi' if is_emulated else '4Gi' }}"
+  limits:
+    cpu: "{{ '500m' if is_emulated else '2000m' }}"
+    memory: "{{ '1Gi' if is_emulated else '8Gi' }}"
+
+grafana_service: "kube-prometheus-stack-grafana"
+grafana_port: 3000
+grafana_admin_user: admin
+vault_grafana_admin_password: "Obs3rv!Grafana2026"
+grafana_credentials_secret: grafana-admin-credentials
+grafana_storage_size: 5Gi
+
+node_exporter_port: 9100
+kube_state_metrics_port: 8080
+
+# --- GCP Stackdriver exporter ---------------------------------------------
+gcp_exporter_name: gcp-stackdriver-exporter
+gcp_exporter_port: 9255
+gcp_exporter_replicas: 1
+# Must match terraform stack var.exporter_k8s_service_account.
+gcp_exporter_k8s_sa: gcp-exporter-sa
+# Overwritten at runtime from `terraform output -json ansible_facts`.
+gcp_exporter_sa_email: "obs-gcp-exporter-sa@{{ gcp_project_id }}.iam.gserviceaccount.com"
+# Monitoring API metric prefixes to pull. Each prefix is one API call per
+# scrape, so keep the list tight: this is the exporter's main cost driver.
+gcp_exporter_metric_prefixes:
+  - "compute.googleapis.com/instance/cpu"
+  - "compute.googleapis.com/instance/disk"
+  - "compute.googleapis.com/instance/network"
+  - "storage.googleapis.com/api"
+  - "storage.googleapis.com/storage"
+  - "loadbalancing.googleapis.com/https"
+  - "kubernetes.io/node"
+  - "kubernetes.io/container"
+gcp_exporter_scrape_interval: 5m
+gcp_exporter_resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# --- RBAC ------------------------------------------------------------------
+# The brief requires get/list/watch on nodes, pods, services and endpoints
+# for both the Prometheus and Filebeat service accounts.
+rbac_core_resources:
+  - nodes
+  - nodes/proxy
+  - nodes/metrics
+  - pods
+  - services
+  - endpoints
+rbac_verbs:
+  - get
+  - list
+  - watch
+
+# --- rendering -------------------------------------------------------------
+# Rendered Helm values and manifests are written here before being applied,
+# so a human can diff exactly what Helm received. Gitignored.
+rendered_dir: "{{ playbook_dir }}/rendered"
+
+# --- waits -----------------------------------------------------------------
+helm_wait: true
+helm_timeout: 15m
+rollout_timeout: 600
