@@ -417,16 +417,6 @@ kibana:
 
   # Credentials come from the Ansible-created Secret, never from values.
   extraEnvs:
-    - name: ELASTICSEARCH_USERNAME
-      valueFrom:
-        secretKeyRef:
-          name: "{{ kibana_credentials_secret }}"
-          key: username
-    - name: ELASTICSEARCH_PASSWORD
-      valueFrom:
-        secretKeyRef:
-          name: "{{ kibana_credentials_secret }}"
-          key: password
     - name: KIBANA_ENCRYPTION_KEY
       valueFrom:
         secretKeyRef:
@@ -441,8 +431,6 @@ kibana:
       server.host: "0.0.0.0"
       server.publicBaseUrl: "http://localhost:{{ kibana_port }}"
       elasticsearch.hosts: ["{{ elasticsearch_protocol }}://{{ elasticsearch_service }}.{{ logging_namespace }}.svc:{{ elasticsearch_port }}"]
-      elasticsearch.username: "${ELASTICSEARCH_USERNAME}"
-      elasticsearch.password: "${ELASTICSEARCH_PASSWORD}"
       elasticsearch.requestTimeout: 90000
       # Stable key: regenerating it on every restart orphans saved objects.
       xpack.encryptedSavedObjects.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"

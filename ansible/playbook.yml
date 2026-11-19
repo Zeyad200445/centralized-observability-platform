@@ -496,6 +496,7 @@
 
     - name: ELK | Deploy Kibana (Deployment + Service on 5601)
       kubernetes.core.helm:
+        disable_hook: "{{ is_emulated | bool }}"
         <<: *k8s_auth
         name: "{{ kibana_release }}"
         chart_ref: elastic/kibana
