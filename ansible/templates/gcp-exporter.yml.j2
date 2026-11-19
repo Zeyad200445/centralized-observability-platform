@@ -49,6 +49,15 @@ data:
 {% endfor %}
   project-id: "{{ gcp_project_id }}"
   scrape-interval: "{{ gcp_exporter_scrape_interval }}"
+{% if is_emulated | bool %}
+  adc.json: |
+    {
+      "type": "authorized_user",
+      "client_id": "floci-local-client-id",
+      "client_secret": "floci-local-client-secret",
+      "refresh_token": "floci-local-refresh-token"
+    }
+{% endif %}
 
 ---
 # ---------------------------------------------------------------------------
@@ -154,6 +163,8 @@ spec:
               value: "false"
             - name: GOOGLE_OAUTH_ACCESS_TOKEN
               value: "floci-mock-access-token"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: "/etc/stackdriver-exporter/adc.json"
 {% else %}
             # Cloud: no credentials here at all. The client library finds the
             # GKE metadata server on its own and exchanges the projected SA
