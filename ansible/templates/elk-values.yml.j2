@@ -119,7 +119,7 @@ elasticsearch:
       xpack.security.transport.ssl.enabled: false
       {% else %}
       # --- Cloud Environment (GCP/GKE) ---
-      xpack.security.transport.ssl.enabled: true
+      xpack.security.transport.ssl.enabled: false
       {% endif %}
 
 {% if is_emulated | bool %}

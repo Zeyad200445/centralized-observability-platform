@@ -30,9 +30,7 @@ terraform {
     }
   }
 
-  backend "gcs" {
+  backend "local" {
     # Overridden by -backend-config at init time.
-    bucket = "CHANGE-ME-tfstate"
-    prefix = "observability/gcp"
   }
 }
