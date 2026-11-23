@@ -87,7 +87,7 @@ elasticsearch_resources:
 # Credentials injected as a Kubernetes Secret, never baked into values.
 elastic_username: elastic
 vault_elastic_password: "Obs3rv!Elastic2026"
-elastic_credentials_secret: elastic-credentials
+elastic_credentials_secret: elasticsearch-master-credentials
 
 # TLS between the ELK components. Off locally so the stack boots on k3s
 # without a cert-manager dependency; on by default in the cloud.

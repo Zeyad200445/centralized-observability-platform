@@ -252,7 +252,6 @@ resource "google_container_node_pool" "this" {
       content {
         sysctls = {
           "net.core.somaxconn"           = "4096"
-          "net.ipv4.tcp_max_syn_backlog" = "8192"
         }
       }
     }

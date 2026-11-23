@@ -191,7 +191,7 @@ sleep "${LOG_PROPAGATION_WAIT}"
 # ------------------------------------------------------ 5. logging pipeline
 section "5. Elasticsearch: indices and parsed Grok fields"
 if [[ -z "${ES_PASSWORD}" ]]; then
-  ES_PASSWORD=$(kubectl -n "${NS_LOGGING}" get secret elastic-credentials \
+  ES_PASSWORD=$(kubectl -n "${NS_LOGGING}" get secret elasticsearch-master-credentials \
     -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
 fi
 ES_AUTH=()
