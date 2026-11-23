@@ -199,9 +199,9 @@ ES_AUTH=()
 
 if port_forward "${NS_LOGGING}" "${ES_SVC}" "${ES_LOCAL_PORT}" 9200; then
   pass "port-forward to ${ES_SVC} established on :${ES_LOCAL_PORT}"
-  ES="http://127.0.0.1:${ES_LOCAL_PORT}"
+  if kubectl -n "${NS_LOGGING}" get secret elasticsearch-master-certs >/dev/null 2>&1; then ES="https://127.0.0.1:${ES_LOCAL_PORT}"; else ES="http://127.0.0.1:${ES_LOCAL_PORT}"; fi
 
-  health=$(curl -s "${ES_AUTH[@]}" "${ES}/_cluster/health" \
+  health=$(curl -sk "${ES_AUTH[@]}" "${ES}/_cluster/health" \
     | sed -n 's/.*"status":"\([a-z]*\)".*/\1/p')
   case "${health}" in
     green|yellow) pass "Elasticsearch cluster health is ${health}" ;;
@@ -209,9 +209,9 @@ if port_forward "${NS_LOGGING}" "${ES_SVC}" "${ES_LOCAL_PORT}" 9200; then
   esac
 
   echo "  --- _cat/indices ---"
-  curl -s "${ES_AUTH[@]}" "${ES}/_cat/indices?v" | sed 's/^/          /' || true
+  curl -sk "${ES_AUTH[@]}" "${ES}/_cat/indices?v" | sed 's/^/          /' || true
 
-  idx_count=$(curl -s "${ES_AUTH[@]}" "${ES}/_cat/indices/${INDEX_PREFIX}*?h=index" \
+  idx_count=$(curl -sk "${ES_AUTH[@]}" "${ES}/_cat/indices/${INDEX_PREFIX}*?h=index" \
     | grep -c "${INDEX_PREFIX}" || true)
   if [[ "${idx_count}" -gt 0 ]]; then
     pass "found ${idx_count} daily index/indices matching ${INDEX_PREFIX}*"
@@ -220,7 +220,7 @@ if port_forward "${NS_LOGGING}" "${ES_SVC}" "${ES_LOCAL_PORT}" 9200; then
   fi
 
   # Did Grok actually split the raw line into typed fields?
-  resp=$(curl -s "${ES_AUTH[@]}" -H 'Content-Type: application/json' \
+  resp=$(curl -sk "${ES_AUTH[@]}" -H 'Content-Type: application/json' \
     -XPOST "${ES}/${INDEX_PREFIX}*/_search?size=1" -d '{
       "query": { "bool": { "filter": [
         { "term": { "http_status": 404 } },
@@ -238,7 +238,7 @@ if port_forward "${NS_LOGGING}" "${ES_SVC}" "${ES_LOCAL_PORT}" 9200; then
   fi
 
   for field in http_method request_path http_status bytes_sent log_level raw_message; do
-    f=$(curl -s "${ES_AUTH[@]}" -H 'Content-Type: application/json' \
+    f=$(curl -sk "${ES_AUTH[@]}" -H 'Content-Type: application/json' \
       -XPOST "${ES}/${INDEX_PREFIX}*/_search?size=0" \
       -d "{\"query\":{\"exists\":{\"field\":\"${field}\"}}}" \
       | sed -n 's/.*"hits":{"total":{"value":\([0-9]*\).*/\1/p')
@@ -249,7 +249,7 @@ if port_forward "${NS_LOGGING}" "${ES_SVC}" "${ES_LOCAL_PORT}" 9200; then
     fi
   done
 
-  k8s=$(curl -s "${ES_AUTH[@]}" -H 'Content-Type: application/json' \
+  k8s=$(curl -sk "${ES_AUTH[@]}" -H 'Content-Type: application/json' \
     -XPOST "${ES}/${INDEX_PREFIX}*/_search?size=0" \
     -d '{"query":{"term":{"kubernetes.namespace":"workload"}}}' \
     | sed -n 's/.*"hits":{"total":{"value":\([0-9]*\).*/\1/p')

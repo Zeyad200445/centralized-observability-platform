@@ -189,6 +189,13 @@ logstash:
           name: logstash-es-credentials
           key: password
 
+{% if elasticsearch_protocol == 'https' %}
+  secretMounts:
+    - name: elasticsearch-certs
+      secretName: elasticsearch-master-certs
+      path: /usr/share/logstash/config/certs
+{% endif %}
+
   # ---- Service: this is what Filebeat ships to --------------------------
   service:
     type: ClusterIP
@@ -288,6 +295,7 @@ logstash:
                 "ISO8601"
               ]
               target => "@timestamp"
+              remove_field => ["timestamp"]
               tag_on_failure => ["_dateparsefailure"]
             }
           }
@@ -374,9 +382,10 @@ logstash:
           user   => "${ELASTICSEARCH_USERNAME}"
           password => "${ELASTICSEARCH_PASSWORD}"
           index  => "{{ logstash_index_pattern }}-%{+YYYY.MM.dd}"
-{% if elasticsearch_tls_enabled | bool %}
+{% if elasticsearch_protocol == 'https' %}
           ssl => true
-          ssl_verification_mode => "full"
+          cacert => "/usr/share/logstash/config/certs/ca.crt"
+          ssl_certificate_verification => true
 {% else %}
           ssl => false
 {% endif %}
