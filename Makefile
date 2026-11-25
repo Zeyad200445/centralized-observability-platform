@@ -156,14 +156,24 @@ check: galaxy ## Dry-run the playbook (--check --diff)
 	  -e kubeconfig_path=$(KUBECONFIG_FILE)
 
 # ==============================  WORKLOAD  ==================================
+# Switch workload dynamically: WORKLOAD=nginx (default) | WORKLOAD=vprofile
+WORKLOAD           ?= nginx
+
 .PHONY: workload
-workload: ## Deploy the NGINX test workload + 200/404 load generator
-	KUBECONFIG=$(KUBECONFIG_FILE) kubectl apply -f $(ROOT_DIR)/workloads/test-app.yaml
-	KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n workload rollout status deploy/nginx-demo --timeout=180s
+workload: ## Deploy workload (WORKLOAD=nginx or WORKLOAD=vprofile)
+	@if [ "$(WORKLOAD)" = "vprofile" ]; then \
+	  echo "Deploying 5-tier VProfile workload..."; \
+	  KUBECONFIG=$(KUBECONFIG_FILE) kubectl apply -f $(ROOT_DIR)/workloads/vprofile.yaml; \
+	  KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n workload rollout status deploy/vproweb --timeout=240s; \
+	else \
+	  echo "Deploying NGINX test workload..."; \
+	  KUBECONFIG=$(KUBECONFIG_FILE) kubectl apply -f $(ROOT_DIR)/workloads/test-app.yaml; \
+	  KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n workload rollout status deploy/nginx-demo --timeout=180s; \
+	fi
 
 .PHONY: smoke
-smoke: ## End-to-end verification of both pipelines
-	KUBECONFIG=$(KUBECONFIG_FILE) $(ROOT_DIR)/scripts/smoke-test.sh
+smoke: ## End-to-end verification (WORKLOAD=nginx or WORKLOAD=vprofile)
+	KUBECONFIG=$(KUBECONFIG_FILE) WORKLOAD=$(WORKLOAD) $(ROOT_DIR)/scripts/smoke-test.sh
 
 # ===============================  ACCESS  ===================================
 .PHONY: kibana
