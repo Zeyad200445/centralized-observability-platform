@@ -157,9 +157,11 @@ check: galaxy ## Dry-run the playbook (--check --diff)
 
 # ==============================  WORKLOAD  ==================================
 .PHONY: workload
-workload: ## Deploy the NGINX test workload + 200/404 load generator
-	KUBECONFIG=$(KUBECONFIG_FILE) kubectl apply -f $(ROOT_DIR)/workloads/test-app.yaml
-	KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n workload rollout status deploy/nginx-demo --timeout=180s
+workload: ## Deploy the VProfile multi-tier workload with observability sidecar
+	KUBECONFIG=$(KUBECONFIG_FILE) kubectl apply -f $(ROOT_DIR)/workloads/vprofile.yaml
+	KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n workload rollout status deploy/vprodb --timeout=600s
+	KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n workload rollout status deploy/vproapp --timeout=300s
+	KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n workload rollout status deploy/vproweb --timeout=180s
 
 .PHONY: smoke
 smoke: ## End-to-end verification of both pipelines
@@ -181,6 +183,10 @@ prometheus: ## Port-forward Prometheus to http://localhost:9090
 .PHONY: elasticsearch
 elasticsearch: ## Port-forward Elasticsearch to http://localhost:9200
 	KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n logging port-forward svc/elasticsearch-master 9200:9200
+
+.PHONY: vprofile
+vprofile: ## Port-forward VProfile web UI to http://localhost:8088
+	KUBECONFIG=$(KUBECONFIG_FILE) kubectl -n workload port-forward --address 0.0.0.0 svc/vproweb 8088:80
 
 .PHONY: pods
 pods: ## Show pods in all three namespaces

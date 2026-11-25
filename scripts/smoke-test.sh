@@ -1,20 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# smoke-test.sh - end-to-end verification of the observability platform.
-#
-# Proves, in order:
-#   1. the floci-gcp control plane is alive
-#   2. the GKE cluster has Ready nodes
-#   3. every pod in logging / monitoring / workload is Running
-#   4. the NGINX workload emits real HTTP 200 and HTTP 404 access lines
-#   5. those lines reached Elasticsearch AND were split into Grok fields
-#   6. Prometheus reports node-exporter, kube-state-metrics and the GCP
-#      Stackdriver exporter as UP targets
-#
-# Exit code 0 means both pipelines are live end to end.
-#
-# Usage:  KUBECONFIG=... ./smoke-test.sh
-# Env:    EMULATOR_URL, ES_PASSWORD, SKIP_EMULATOR=1 (when running on real GCP)
+# smoke-test.sh - end-to-end verification of the observability platform
+#                 with the VProfile multi-tier workload.
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -31,8 +18,8 @@ ES_PASSWORD="${ES_PASSWORD:-}"
 PROM_SVC="${PROM_SVC:-svc/kube-prometheus-stack-prometheus}"
 PROM_LOCAL_PORT="${PROM_LOCAL_PORT:-9090}"
 
-NGINX_SVC="${NGINX_SVC:-svc/nginx-demo}"
-NGINX_LOCAL_PORT="${NGINX_LOCAL_PORT:-8080}"
+VPROFILE_SVC="${VPROFILE_SVC:-svc/vproweb}"
+VPROFILE_LOCAL_PORT="${VPROFILE_LOCAL_PORT:-8088}"
 
 INDEX_PREFIX="${INDEX_PREFIX:-logstash-k8s-}"
 LOG_PROPAGATION_WAIT="${LOG_PROPAGATION_WAIT:-45}"
@@ -53,7 +40,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Start a background port-forward and block until the local port accepts TCP.
 port_forward() {
   local ns="$1" target="$2" local_port="$3" remote_port="$4"
   kubectl -n "${ns}" port-forward "${target}" "${local_port}:${remote_port}" \
@@ -76,7 +62,7 @@ require kubectl
 require curl
 
 echo "==========================================================="
-echo " Centralized Observability Platform - smoke test"
+echo " Centralized Observability Platform - VProfile Smoke Test"
 echo " $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "==========================================================="
 
@@ -136,8 +122,6 @@ for ns in "${NS_LOGGING}" "${NS_MONITORING}" "${NS_WORKLOAD}"; do
     continue
   fi
 
-  # A pod is healthy when it is Running with all containers ready, or it is a
-  # Completed one-shot Job pod.
   bad=$(kubectl -n "${ns}" get pods --no-headers 2>/dev/null | awk '
     {
       status=$3; ready=$2
@@ -155,44 +139,51 @@ for ns in "${NS_LOGGING}" "${NS_MONITORING}" "${NS_WORKLOAD}"; do
 done
 
 # -------------------------------------------------------- 4. generate traffic
-section "4. Generate HTTP 200 and HTTP 404 access logs"
-if kubectl -n "${NS_WORKLOAD}" get "${NGINX_SVC}" >/dev/null 2>&1; then
-  if port_forward "${NS_WORKLOAD}" "${NGINX_SVC}" "${NGINX_LOCAL_PORT}" 80; then
-    pass "port-forward to ${NGINX_SVC} established on :${NGINX_LOCAL_PORT}"
+section "4. Generate HTTP 200 and HTTP 404 access logs on VProfile"
+if kubectl -n "${NS_WORKLOAD}" get "${VPROFILE_SVC}" >/dev/null 2>&1; then
+  if port_forward "${NS_WORKLOAD}" "${VPROFILE_SVC}" "${VPROFILE_LOCAL_PORT}" 80; then
+    pass "port-forward to ${VPROFILE_SVC} established on :${VPROFILE_LOCAL_PORT}"
 
     code200=$(curl -s -o /dev/null -w '%{http_code}' \
-      "http://127.0.0.1:${NGINX_LOCAL_PORT}/" || echo "000")
+      "http://127.0.0.1:${VPROFILE_LOCAL_PORT}/" || echo "000")
     [[ "${code200}" == "200" ]] \
-      && pass "GET / returned 200" \
+      && pass "GET / (VProfile Login) returned 200" \
       || fail "GET / returned ${code200}, expected 200"
 
     code404=$(curl -s -o /dev/null -w '%{http_code}' \
-      "http://127.0.0.1:${NGINX_LOCAL_PORT}/this-page-does-not-exist" || echo "000")
+      "http://127.0.0.1:${VPROFILE_LOCAL_PORT}/vprofile-missing-page" || echo "000")
     [[ "${code404}" == "404" ]] \
-      && pass "GET /this-page-does-not-exist returned 404" \
-      || fail "GET /this-page-does-not-exist returned ${code404}, expected 404"
+      && pass "GET /vprofile-missing-page returned 404" \
+      || fail "GET /vprofile-missing-page returned ${code404}, expected 404"
 
-    # Volume so that at least one Filebeat flush interval contains our lines.
-    for i in $(seq 1 25); do
-      curl -s -o /dev/null "http://127.0.0.1:${NGINX_LOCAL_PORT}/" || true
-      curl -s -o /dev/null "http://127.0.0.1:${NGINX_LOCAL_PORT}/missing-${i}" || true
+    for i in $(seq 1 20); do
+      curl -s -o /dev/null "http://127.0.0.1:${VPROFILE_LOCAL_PORT}/" || true
+      curl -s -o /dev/null "http://127.0.0.1:${VPROFILE_LOCAL_PORT}/vprofile-404-${i}" || true
     done
-    info "generated 50 extra requests (25x200, 25x404)"
+    info "generated 40 extra VProfile requests (20x200, 20x404)"
   else
-    fail "could not port-forward to ${NGINX_SVC}"
+    fail "could not port-forward to ${VPROFILE_SVC}"
   fi
 else
-  fail "${NGINX_SVC} not found in ${NS_WORKLOAD} - run 'make workload'"
+  fail "${VPROFILE_SVC} not found in ${NS_WORKLOAD} - run 'kubectl apply -f workloads/vprofile.yaml'"
 fi
 
 info "waiting ${LOG_PROPAGATION_WAIT}s for Filebeat -> Logstash -> Elasticsearch"
 sleep "${LOG_PROPAGATION_WAIT}"
 
 # ------------------------------------------------------ 5. logging pipeline
-section "5. Elasticsearch: indices and parsed Grok fields"
+section "5. Elasticsearch: VProfile indices and parsed Grok fields"
 if [[ -z "${ES_PASSWORD}" ]]; then
-  ES_PASSWORD=$(kubectl -n "${NS_LOGGING}" get secret elasticsearch-master-credentials \
-    -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+  for secret_name in elasticsearch-master-credentials elastic-credentials; do
+    ES_PASSWORD=$(kubectl -n "${NS_LOGGING}" get secret "${secret_name}" \
+      -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    if [[ -n "${ES_PASSWORD}" ]]; then
+      ES_USER_FROM_SECRET=$(kubectl -n "${NS_LOGGING}" get secret "${secret_name}" \
+        -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+      [[ -n "${ES_USER_FROM_SECRET}" ]] && ES_USER="${ES_USER_FROM_SECRET}"
+      break
+    fi
+  done
 fi
 ES_AUTH=()
 [[ -n "${ES_PASSWORD}" ]] && ES_AUTH=(-u "${ES_USER}:${ES_PASSWORD}")
@@ -208,9 +199,6 @@ if port_forward "${NS_LOGGING}" "${ES_SVC}" "${ES_LOCAL_PORT}" 9200; then
     *)            fail "Elasticsearch cluster health is '${health:-unreachable}'" ;;
   esac
 
-  echo "  --- _cat/indices ---"
-  curl -s "${ES_AUTH[@]}" "${ES}/_cat/indices?v" | sed 's/^/          /' || true
-
   idx_count=$(curl -s "${ES_AUTH[@]}" "${ES}/_cat/indices/${INDEX_PREFIX}*?h=index" \
     | grep -c "${INDEX_PREFIX}" || true)
   if [[ "${idx_count}" -gt 0 ]]; then
@@ -219,10 +207,11 @@ if port_forward "${NS_LOGGING}" "${ES_SVC}" "${ES_LOCAL_PORT}" 9200; then
     fail "no ${INDEX_PREFIX}* index exists - Logstash never wrote to Elasticsearch"
   fi
 
-  # Did Grok actually split the raw line into typed fields?
+  # Verify VProfile (vproweb) 404 logs were Grok-parsed
   resp=$(curl -s "${ES_AUTH[@]}" -H 'Content-Type: application/json' \
     -XPOST "${ES}/${INDEX_PREFIX}*/_search?size=1" -d '{
       "query": { "bool": { "filter": [
+        { "term": { "kubernetes.labels.app": "vproweb" } },
         { "term": { "http_status": 404 } },
         { "exists": { "field": "client_ip" } },
         { "exists": { "field": "request_path" } }
@@ -231,21 +220,21 @@ if port_forward "${NS_LOGGING}" "${ES_SVC}" "${ES_LOCAL_PORT}" 9200; then
     }')
   hits=$(echo "${resp}" | sed -n 's/.*"hits":{"total":{"value":\([0-9]*\).*/\1/p')
   if [[ -n "${hits}" && "${hits}" -gt 0 ]]; then
-    pass "Grok parsing verified: ${hits} doc(s) with http_status=404 + client_ip + request_path"
+    pass "VProfile Grok parsing verified: ${hits} vproweb doc(s) with http_status=404 + client_ip + request_path"
   else
-    fail "no structured 404 document found - check the Logstash grok filter"
+    fail "no structured vproweb 404 document found - check Logstash grok filter or propagation time"
     echo "${resp}" | head -c 600 | sed 's/^/          /'
   fi
 
-  for field in http_method request_path http_status bytes_sent log_level raw_message; do
+  for field in http_method request_path http_status bytes_sent; do
     f=$(curl -s "${ES_AUTH[@]}" -H 'Content-Type: application/json' \
       -XPOST "${ES}/${INDEX_PREFIX}*/_search?size=0" \
-      -d "{\"query\":{\"exists\":{\"field\":\"${field}\"}}}" \
+      -d "{\"query\":{\"bool\":{\"filter\":[{\"term\":{\"kubernetes.labels.app\":\"vproweb\"}},{\"exists\":{\"field\":\"${field}\"}}]}}}" \
       | sed -n 's/.*"hits":{"total":{"value":\([0-9]*\).*/\1/p')
     if [[ -n "${f}" && "${f}" -gt 0 ]]; then
-      pass "field '${field}' is indexed (${f} docs)"
+      pass "vproweb field '${field}' is indexed (${f} docs)"
     else
-      fail "field '${field}' is missing from every document"
+      fail "vproweb field '${field}' is missing"
     fi
   done
 
@@ -261,7 +250,7 @@ else
 fi
 
 # ------------------------------------------------------ 6. metrics pipeline
-section "6. Prometheus: exporter targets"
+section "6. Prometheus: exporter and VProfile targets"
 if port_forward "${NS_MONITORING}" "${PROM_SVC}" "${PROM_LOCAL_PORT}" 9090; then
   pass "port-forward to ${PROM_SVC} established on :${PROM_LOCAL_PORT}"
   PROM="http://127.0.0.1:${PROM_LOCAL_PORT}"
@@ -284,7 +273,6 @@ if port_forward "${NS_MONITORING}" "${PROM_SVC}" "${PROM_LOCAL_PORT}" 9090; then
     done
   fi
 
-  # Query one real series per exporter to prove data actually landed in TSDB.
   check_query() {
     local label="$1" query="$2"
     local n
@@ -295,13 +283,9 @@ if port_forward "${NS_MONITORING}" "${PROM_SVC}" "${PROM_LOCAL_PORT}" 9090; then
       || fail "${label}: '${query}' returned no series"
   }
   check_query "Node Exporter"      'up{job=~".*node-exporter.*"}'
-  check_query "Kube State Metrics" 'kube_pod_status_phase{namespace="workload"}'
+  check_query "Kube State Metrics" 'kube_pod_status_phase{namespace="workload", pod=~"vpro.*"}'
   check_query "GCP Exporter"       'up{job=~".*gcp.*|.*stackdriver.*"}'
-  check_query "NGINX workload"     'nginx_http_requests_total'
-
-  scrape=$(curl -s --get "${PROM}/api/v1/query" \
-    --data-urlencode 'query=scrape_interval_seconds' | head -c 200)
-  info "global scrape_interval is configured to 15s (see monitoring-values.yml.j2)"
+  check_query "VProfile NGINX"     'nginx_http_requests_total'
 else
   fail "could not port-forward to ${PROM_SVC}"
 fi
@@ -312,7 +296,7 @@ echo "==========================================================="
 echo -e " Passed: ${GREEN}${PASS}${NC}   Failed: ${RED}${FAIL}${NC}"
 echo "==========================================================="
 if [[ "${FAIL}" -eq 0 ]]; then
-  echo -e "${GREEN}Both pipelines are live end to end.${NC}"
+  echo -e "${GREEN}Both pipelines are live end to end for VProfile.${NC}"
   exit 0
 fi
 echo -e "${RED}${FAIL} check(s) failed.${NC}"

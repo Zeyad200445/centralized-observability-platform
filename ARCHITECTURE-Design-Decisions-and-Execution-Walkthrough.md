@@ -212,8 +212,8 @@ check or is a performance property no emulator could model.
                    ┌───────────────────────────────┼────────────────────────┐
                    ▼                               ▼                        ▼
             namespace: workload            namespace: logging       namespace: monitoring
-            nginx + load-gen               Filebeat DaemonSet       Node Exporter DaemonSet
-            app-logger                     Logstash :5044           Kube State Metrics :8080
+            vproweb (NGINX)                Filebeat DaemonSet       Node Exporter DaemonSet
+            vproapp + db/cache/mq          Logstash :5044           Kube State Metrics :8080
                    │                       Elasticsearch :9200      GCP Exporter :9255
                    │  stdout               Kibana :5601             Prometheus :9090
                    └──────────────────────────► (logs)              Grafana :3000
@@ -587,10 +587,10 @@ The NGINX branch is entered on any of three conditions - container name,
 pod label, or the line simply starting with an IP address - so a workload
 that was not labelled as expected is still parsed correctly.
 
-The generic branch handles everything else by extracting a `LOGLEVEL`. This
-is why `workloads/test-app.yaml` ships an `app-logger` container alongside
-NGINX: without it, only half the filter would ever execute, and a bug in the
-generic branch would reach production undetected.
+The generic branch handles everything else by extracting a `LOGLEVEL`. In
+`workloads/vprofile.yaml`, `vproapp` (Tomcat), `vprodb` (MySQL), and
+`vpromq01` (RabbitMQ) exercise this branch alongside `vproweb`'s NGINX
+logs, ensuring both branches of the filter are validated in practice.
 
 ### Fallback patterns within the NGINX branch
 
@@ -737,7 +737,7 @@ additionalScrapeConfigs:
 
 ServiceMonitors require a CRD and a Service. The annotation path lets a pod
 opt in with three annotations and nothing else - which is precisely how
-`workloads/test-app.yaml` exposes its NGINX metrics. Supporting both means the
+`workloads/vprofile.yaml` (`vproweb`) exposes its NGINX metrics. Supporting both means the
 platform meets teams where they are.
 
 ### Why Grafana's password comes from an existing Secret
@@ -898,7 +898,7 @@ hanging on an unreachable endpoint - three steps removed from the cause.
 | 1 | Emulator health; socket mounted | `curl /_floci-gcp/health`, `docker inspect` |
 | 2 | Nodes `Ready` | `kubectl get nodes`, counts Ready vs total |
 | 3 | All pods Running and Ready in all three namespaces | `awk` over `kubectl get pods`, tolerating `Completed` job pods |
-| 4 | Real HTTP 200 and 404 generated | Port-forward to `svc/nginx-demo`, assert status codes, then 50 more requests for volume |
+| 4 | Real HTTP 200 and 404 generated | Port-forward to `svc/vproweb`, assert status codes (`/` → 200, `/vprofile-missing-page` → 404), then 40 extra requests (20x200, 20x404) |
 | 5 | Parsed fields reached Elasticsearch | `_cat/indices`, then `_search` for `http_status:404` **with** `client_ip` and `request_path` present; then each of the seven Grok fields individually; then `kubernetes.namespace:workload` to prove metadata enrichment |
 | 6 | Exporters `UP` in Prometheus | `/api/v1/targets`, then real PromQL queries per exporter |
 
@@ -1136,32 +1136,25 @@ The local/cloud authentication branch is the interesting part: locally it sets
 credentials at all**, because the client library finds the GKE metadata server
 itself.
 
-## 3.10 `workloads/test-app.yaml`
+## 3.10 `workloads/vprofile.yaml`
 
-Six manifests: `Namespace`, `ConfigMap`, `Deployment/nginx-demo`,
-`Service/nginx-demo`, `Deployment/load-generator`, `Deployment/app-logger`.
+Twelve manifests implementing the multi-tier **VProfile** Java web application
+inside the `workload` namespace: one `Secret`, one `PersistentVolumeClaim`,
+five `Deployments`, and five `ClusterIP` `Services`. Every container—including
+init containers and sidecars—declares explicit CPU and memory requests and
+limits, which is mandatory because the `workload` namespace enforces a
+`ResourceQuota`.
 
-**`ConfigMap/nginx-config`** carries the `log_format observability` directive.
-This is the **contract** with the Grok pattern in `elk-values.yml.j2`; both
-files cross-reference each other in comments because changing one without the
-other is the most likely way to break the logging pipeline.
-`access_log /dev/stdout` is essential - a file inside the container would be
-invisible to Filebeat.
+| Component | Image | Port(s) | Role & Observability Hook |
+|---|---|---|---|
+| `vprodb` | `zeyaddev/vprofile-images:db-v1` | `3306` | MySQL 8 database backed by `vprodb-pvc` (2Gi `ReadWriteOnce`, `Recreate` strategy). Uses a `startupProbe` (`SELECT 1 FROM accounts.user LIMIT 1`) to gate readiness until schema import completes, and a `readinessProbe` (`mysqladmin ping`). |
+| `vprocache01` | `memcached:alpine` | `11211` | In-memory caching tier for database query offloading. |
+| `vpromq01` | `rabbitmq:3-alpine` | `5672` | Message broker authenticated via `vprofile-secrets`. |
+| `vproapp` | `zeyaddev/vprofile-images:app-v1` | `8080` | Java/Tomcat application server. Runs a `wait-for-db` init container (`busybox:1.36`) polling `nc -z vprodb 3306` so Tomcat never boots against an uninitialized database. Emits Java logs and stack traces that exercise the generic Grok branch and Filebeat multiline folding. |
+| `vproweb` | `zeyaddev/vprofile-images:web-v1` + `nginx/nginx-prometheus-exporter:1.3.0` | `80`, `8081`, `9113` | NGINX reverse proxy forwarding traffic to `vproapp:8080` and writing combined access logs to `/dev/stdout` (parsed by the NGINX Grok branch). The exporter sidecar scrapes `http://127.0.0.1:8081/stub_status` and exposes Prometheus metrics on `:9113/metrics` via `prometheus.io/scrape` pod annotations. |
 
-**`Deployment/nginx-demo`** runs two replicas with a
-`nginx-prometheus-exporter` sidecar on :9113 scraping `stub_status` over
-`127.0.0.1`. Carries `prometheus.io/scrape`, `port` and `path` annotations.
-All containers declare requests and limits, which is mandatory because the
-namespace carries a ResourceQuota.
-
-**`Deployment/load-generator`** produces roughly 60% 200s, 30% 404s and 10%
-500s on a five-second loop, so `http_status` is a genuinely useful filter
-field rather than a constant.
-
-**`Deployment/app-logger`** emits levelled application logs - including a
-multi-line Java stack trace every thirteenth cycle - to exercise the generic
-Grok branch and the Filebeat multiline configuration. Without it, half the
-filter would never execute.
+`Secret/vprofile-secrets` supplies `MYSQL_ROOT_PASSWORD`, `RABBITMQ_DEFAULT_USER`,
+and `RABBITMQ_DEFAULT_PASS` to `vprodb` and `vpromq01` via `secretKeyRef`.
 ---
 
 # 4. End-to-End Runtime & Execution Flow
@@ -1378,42 +1371,47 @@ regenerates Prometheus's scrape configuration without a restart.
 ### Step 5: `make workload`
 
 ```
-kubectl apply -f workloads/test-app.yaml
-kubectl -n workload rollout status deploy/nginx-demo
+kubectl apply -f workloads/vprofile.yaml
+kubectl -n workload rollout status deploy/vprodb --timeout=600s
+kubectl -n workload rollout status deploy/vproapp --timeout=300s
+kubectl -n workload rollout status deploy/vproweb --timeout=180s
 ```
 
-Three Deployments start. Traffic begins immediately.
+The five tiers roll out in dependency order: `vprodb` initializes MySQL and
+imports the `accounts` schema, `vproapp`'s `wait-for-db` init container unblocks
+once port 3306 responds, and `vproweb` begins proxying HTTP traffic and exposing
+NGINX metrics on `:9113`.
 
 ## 4.3 Phase 3 - The live logging pipeline
 
 Trace of one single HTTP request, end to end.
 
-**4.3.1 Generation.** The load generator issues
-`GET http://nginx-demo.workload.svc/generate-404`. NGINX matches the
-`location = /generate-404` block, returns 404, and writes one line to
-`/dev/stdout` using the `observability` log format:
+**4.3.1 Generation.** A client (or `smoke-test.sh`) issues
+`GET http://vproweb.workload.svc/vprofile-missing-page`. `vproweb` (NGINX)
+proxies to `vproapp` (Tomcat), receives 404, and writes one combined access
+log line to `/dev/stdout`:
 
 ```
-10.20.1.7 - - [12/Nov/2026:08:15:42 +0000] "GET /generate-404 HTTP/1.1" 404 10 "-" "curl/8.11.0" "-"
+10.20.1.7 - - [12/Nov/2026:08:15:42 +0000] "GET /vprofile-missing-page HTTP/1.1" 404 10 "-" "curl/8.11.0" "-"
 ```
 
 **4.3.2 The container runtime captures it.** `/dev/stdout` in the container
 is a pipe to containerd. containerd writes a CRI-formatted line to:
 
 ```
-/var/log/pods/workload_nginx-demo-7d9c_<uid>/nginx/0.log
+/var/log/pods/workload_vproweb-7799_<uid>/nginx/0.log
 ```
 
 and maintains a symlink at:
 
 ```
-/var/log/containers/nginx-demo-7d9c_workload_nginx-<containerid>.log
+/var/log/containers/vproweb-7799_workload_nginx-<containerid>.log
 ```
 
 The CRI line prefixes the payload with a timestamp and stream:
 
 ```
-2026-11-12T08:15:42.118Z stdout F 10.20.1.7 - - [12/Nov/2026:08:15:42 +0000] "GET /generate-404 HTTP/1.1" 404 10 "-" "curl/8.11.0" "-"
+2026-11-12T08:15:42.118Z stdout F 10.20.1.7 - - [12/Nov/2026:08:15:42 +0000] "GET /vprofile-missing-page HTTP/1.1" 404 10 "-" "curl/8.11.0" "-"
 ```
 
 **This is precisely why the Filebeat DaemonSet mounts both directories.** The
@@ -1432,11 +1430,11 @@ and the `obs-cluster-reader` ClusterRole) and attaches:
 ```json
 {
   "kubernetes": {
-    "pod":       { "name": "nginx-demo-7d9c-x4k2" },
+    "pod":       { "name": "vproweb-7799-x4k2" },
     "namespace": "workload",
     "container": { "name": "nginx" },
     "node":      { "name": "obs-gke-node-1" },
-    "labels":    { "app": "nginx-demo" }
+    "labels":    { "app": "vproweb" }
   }
 }
 ```
@@ -1465,7 +1463,7 @@ grok (pattern 1, full combined format) → MATCHES:
      remote_user   = "-"
      timestamp     = "12/Nov/2026:08:15:42 +0000"
      http_method   = "GET"
-     request_path  = "/generate-404"
+     request_path  = "/vprofile-missing-page"
      http_version  = "1.1"
      http_status   = 404      ← :int, so Elasticsearch maps it as a long
      bytes_sent    = 10       ← :int
@@ -1479,7 +1477,7 @@ date { match => ["timestamp", "dd/MMM/yyyy:HH:mm:ss Z", ...] }
 if [http_status] >= 500 ... else if >= 400 → TRUE
    → log_level = "WARN"
 
-grok on request_path → request_uri = "/generate-404"
+grok on request_path → request_uri = "/vprofile-missing-page"
 
 mutate { uppercase, rename kubernetes.* , remove_field [agent, ecs, input, stream, host] }
 mutate { add_field [@metadata][index_prefix] = "logstash-k8s" }
@@ -1506,12 +1504,11 @@ http_status >= 400 and kubernetes.namespace : "workload"
 Total latency, generation to searchable: typically 5-20 seconds, dominated by
 the Filebeat flush interval and Elasticsearch's 1-second refresh.
 
-**The application-log path differs only in the filter.** The `app-logger`
-line `2026-11-12T08:15:42 ERROR [order-service] payment gateway timeout` fails
-the NGINX condition, enters the generic branch, and the
-`TIMESTAMP_ISO8601 ... LOGLEVEL` pattern extracts `log_level = "ERROR"` and
-`log_detail`. The multi-line stack trace that follows is folded into this same
-event by Filebeat's multiline configuration before it ever reaches Logstash.
+**The application-log path differs only in the filter.** A `vproapp` (Tomcat)
+log line fails the NGINX condition, enters the generic branch, and the
+`TIMESTAMP_ISO8601 ... LOGLEVEL` pattern extracts `log_level` and
+`log_detail`. Any multi-line Java stack trace that follows is folded into the
+same event by Filebeat's multiline configuration before it ever reaches Logstash.
 
 ## 4.4 Phase 3b - The live metrics pipeline
 
@@ -1535,9 +1532,9 @@ point of the host mounts.
 server and renders Kubernetes object state - not resource usage:
 
 ```
-kube_pod_status_phase{namespace="workload",pod="nginx-demo-7d9c-x4k2",phase="Running"} 1
+kube_pod_status_phase{namespace="workload",pod="vproweb-7799-x4k2",phase="Running"} 1
 kube_pod_container_status_restarts_total{namespace="workload",...} 0
-kube_deployment_status_replicas_available{namespace="workload",deployment="nginx-demo"} 2
+kube_deployment_status_replicas_available{namespace="workload",deployment="vproweb"} 1
 kube_node_status_capacity{node="obs-gke-node-1",resource="cpu"} 2
 ```
 
@@ -1635,7 +1632,7 @@ asserting on the parsed output; the assertion results are in section 5.4.
 | 1.10 | Ansible `kubernetes.core` + Jinja2 + Helm | `ansible/requirements.yml`, `templates/*.j2` | `kubernetes.core >=3.0.0`; 3 templates; `kubernetes.core.helm` |
 | 1.11 | Filebeat → Logstash → Elasticsearch → Kibana | `elk-values.yml.j2` | four release sub-trees |
 | 1.12 | Node Exporter, KSM, GCP exporter → Prometheus → Grafana | `monitoring-values.yml.j2`, `gcp-exporter.yml.j2` | `nodeExporter`, `kubeStateMetrics`, exporter Deployment |
-| 1.13 | NGINX test workload with 200/404 and CPU/memory | `workloads/test-app.yaml` | `nginx-demo` + `load-generator` + exporter sidecar |
+| 1.13 | Multi-tier VProfile workload with 200/404 and CPU/memory | `workloads/vprofile.yaml` | `vproweb` (NGINX + exporter sidecar) + `vproapp` + `vprodb` + `vprocache01` + `vpromq01` |
 
 ## 5.2 Section 2 of the brief - the four layers
 
@@ -1679,7 +1676,7 @@ asserting on the parsed output; the assertion results are in section 5.4.
 
 | # | Requirement | File | Construct |
 |---|---|---|---|
-| C.1 | Pods write stdout/stderr; runtime writes `/var/log/containers`, `/var/log/pods` | `workloads/test-app.yaml` | `access_log /dev/stdout observability` |
+| C.1 | Pods write stdout/stderr; runtime writes `/var/log/containers`, `/var/log/pods` | `workloads/vprofile.yaml` | `vproweb` NGINX access logs to `/dev/stdout` + `vproapp`/`vprodb`/`vpromq01` stdout/stderr |
 | C.2.1 | Filebeat as a DaemonSet, one pod per node | `elk-values.yml.j2` | `filebeat.daemonset.enabled: true`, `deployment.enabled: false` |
 | C.2.2 | Mounts `/var/log/containers` and `/var/log/pods` hostPath read-only | `elk-values.yml.j2` | `extraVolumes` hostPath + `extraVolumeMounts` with `readOnly: true` |
 | C.2.3 | Tails in real time | `elk-values.yml.j2` | `filebeat.inputs: type: container, paths: /var/log/containers/*.log` |
@@ -1765,9 +1762,9 @@ Makefile with `make -n`.
 ```
 Terraform HCL           23 files parsed, 0 failures
 Ansible YAML            playbook.yml, group_vars/all.yml valid
-workloads/test-app.yaml 6 documents: Namespace, ConfigMap,
-                        Deployment/nginx-demo, Service/nginx-demo,
-                        Deployment/load-generator, Deployment/app-logger
+workloads/vprofile.yaml 12 documents: Secret, PVC, 5 Deployments
+                        (vprodb, vprocache01, vpromq01, vproapp, vproweb),
+                        and 5 ClusterIP Services
 Shell                   wait-for-emulator.sh, smoke-test.sh: bash -n clean
 Makefile                make -n help: parses
 

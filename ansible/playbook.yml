@@ -494,6 +494,48 @@
         wait_timeout: "{{ helm_timeout }}"
       tags: [logging, helm, logstash]
 
+    - name: ELK | Generate dummy CA cert for Kibana in local HTTP mode
+      ansible.builtin.command: >
+        openssl req -x509 -newkey rsa:2048 -nodes
+        -keyout /tmp/kibana-dummy.key -out /tmp/kibana-dummy-ca.crt
+        -days 365 -subj "/CN=kibana-local-dummy"
+      args:
+        creates: /tmp/kibana-dummy-ca.crt
+      when: not (elasticsearch_tls_enabled | bool)
+      tags: [logging, helm, kibana]
+
+    - name: ELK | Ensure elasticsearch-master-certs Secret exists for Kibana mount
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: elasticsearch-master-certs
+            namespace: "{{ logging_namespace }}"
+          data:
+            ca.crt: "{{ lookup('file', '/tmp/kibana-dummy-ca.crt') | b64encode }}"
+      when: not (elasticsearch_tls_enabled | bool)
+      tags: [logging, helm, kibana]
+
+    - name: ELK | Ensure kibana-kibana-es-token Secret exists when Helm hooks are disabled
+      kubernetes.core.k8s:
+        <<: *k8s_auth
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: "{{ kibana_release }}-kibana-es-token"
+            namespace: "{{ logging_namespace }}"
+          data:
+            token: "{{ '' | b64encode }}"
+      when: is_emulated | bool
+      tags: [logging, helm, kibana]
+
     - name: ELK | Deploy Kibana (Deployment + Service on 5601)
       kubernetes.core.helm:
         disable_hook: "{{ is_emulated | bool }}"
