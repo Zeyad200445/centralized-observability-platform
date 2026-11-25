@@ -27,6 +27,21 @@ changes are required.
 
 ---
 
+## Architecture & Live Proof
+
+### Platform Architecture (ELK + Prometheus/Grafana + VProfile)
+![GKE ELK and Prometheus Monitoring Architecture](docs/images/architecture.png)
+
+### Authentication, RBAC & Workload Identity Flow
+![GKE Observability Authentication and Permissions Flow](docs/images/auth-rbac-flow.png)
+
+### End-to-End Verification Screenshots
+| Automated Smoke Test (`smoke-test.sh`) | Kibana Discover (Parsed Logs) | Grafana Dashboards |
+| :---: | :---: | :---: |
+| ![Smoke Test](docs/images/smoke-test.png) | ![Kibana](docs/images/kibana-logs.png) | ![Grafana](docs/images/grafana-dashboard.png) |
+
+---
+
 ## 1. What gets built
 
 ### Layer A - infrastructure (Terraform)
@@ -107,7 +122,7 @@ container is not a light footprint.
 ### 3.1 Clone and enter
 
 ```bash
-git clone <your-fork-url> centralized-observability-platform
+git clone https://github.com/Zeyad200445/centralized-observability-platform.git centralized-observability-platform
 cd centralized-observability-platform
 ```
 
@@ -256,6 +271,8 @@ for documents with parsed `http_status`, `client_ip` and `request_path`
 fields, and finally asks Prometheus whether the three exporters are `UP`.
 
 Exit code `0` means both pipelines are live end to end.
+
+> **Multi-Tier Workload Verification (`VProfile`):** On the `feat/vprofile-k8s-observability` branch, `scripts/smoke-test.sh` also validates the full 5-tier **VProfile** application (`vproweb`, `vproapp`, `vprodb`, `vprocache01`, `vpromq01`) by generating live HTTP 200/404 traffic, verifying Logstash Grok parsing (`client_ip`, `http_method`, `request_path`, `http_status`, `bytes_sent`) and Kubernetes metadata enrichment in Elasticsearch, and running PromQL queries against Prometheus targets.
 
 ### 4.2 By hand - logging
 
@@ -489,7 +506,8 @@ centralized-observability-platform/
 │       ├── monitoring-values.yml.j2  kube-prometheus-stack values
 │       └── gcp-exporter.yml.j2    exporter manifests + ServiceMonitor
 └── workloads/
-    └── test-app.yaml              nginx + exporter sidecar + load gen + logger
+    ├── test-app.yaml              nginx + exporter sidecar + load gen + logger
+    └── vprofile.yaml              5-tier VProfile workload (feat/vprofile-k8s-observability)
 ```
 
 ---
