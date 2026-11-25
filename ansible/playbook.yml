@@ -648,6 +648,92 @@
       failed_when: false
       tags: [verify, monitoring]
 
+
+    # =======================================================================
+    # LAYER E: READ-ONLY ALERT-TRIAGE AGENT (Feature-Flagged)
+    # =======================================================================
+    - name: Triage | Ensure triage namespace exists
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ triage_namespace }}"
+      when: triage_agent_enabled | bool
+      tags: [triage]
+
+    - name: Triage | Create LLM & Elasticsearch credentials secrets
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition: "{{ item }}"
+      loop:
+        - apiVersion: v1
+          kind: Secret
+          metadata:
+            name: triage-llm-credentials
+            namespace: "{{ triage_namespace }}"
+          type: Opaque
+          stringData:
+            api_key: "{{ vault_triage_llm_api_key }}"
+        - apiVersion: v1
+          kind: Secret
+          metadata:
+            name: triage-es-credentials
+            namespace: "{{ triage_namespace }}"
+          type: Opaque
+          stringData:
+            username: "{{ elastic_username }}"
+            password: "{{ vault_elastic_password }}"
+      no_log: true
+      when: triage_agent_enabled | bool
+      tags: [triage]
+
+    - name: Triage | Render runbooks and agent manifests
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ rendered_dir }}/{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { src: "triage-runbooks.yml.j2", dest: "triage-runbooks.yml" }
+        - { src: "triage-agent.yml.j2", dest: "triage-agent.yml" }
+      when: triage_agent_enabled | bool
+      tags: [triage]
+
+    - name: Triage | Apply runbooks and agent manifests
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        src: "{{ rendered_dir }}/{{ item }}"
+      loop:
+        - triage-runbooks.yml
+        - triage-agent.yml
+      when: triage_agent_enabled | bool
+      tags: [triage]
+
+    - name: Triage | Wait for triage deployments to become ready
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ triage_namespace }}"
+        name: "{{ item }}"
+      register: triage_dep
+      until: >-
+        triage_dep.resources | default([]) | length > 0 and
+        (triage_dep.resources[0].status.readyReplicas | default(0)) >= 1
+      retries: 30
+      delay: 10
+      loop:
+        - prometheus-mcp
+        - elasticsearch-mcp
+        - kubernetes-mcp
+        - triage-agent
+      when: triage_agent_enabled | bool
+      tags: [triage]
+
   # =======================================================================
   # SUMMARY
   # =======================================================================

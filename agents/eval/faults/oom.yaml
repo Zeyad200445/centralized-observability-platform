@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: eval-oom
+  namespace: workload
+  labels:
+    app: eval-oom
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "dd if=/dev/zero of=/dev/shm/fill bs=1M count=64; sleep 60"]
+      resources:
+        requests: { cpu: "10m", memory: "32Mi" }
+        limits:   { cpu: "50m", memory: "32Mi" }

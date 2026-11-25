@@ -204,3 +204,21 @@ all: up local-apply kubeconfig deploy workload smoke ## Full local bring-up
 
 .PHONY: clean
 clean: local-destroy nuke ## Tear everything down
+
+# --- Layer E: Read-Only Alert-Triage Agent ---------------------------------
+.PHONY: triage-build triage-deploy triage-logs triage-eval
+
+triage-build:
+	docker build -t obs-mcp-servers:local agents/mcp-servers
+	docker build -t obs-triage-agent:local agents/triage-agent
+	@K3S_CONTAINER=$$(docker ps --filter "ancestor=rancher/k3s:latest" --format "{{.Names}}" | head -n 1); \
+	docker save obs-mcp-servers:local obs-triage-agent:local | docker exec -i "$$K3S_CONTAINER" ctr images import -
+
+triage-deploy:
+	(cd ansible && ansible-playbook playbook.yml -e triage_agent_enabled=true --tags triage)
+
+triage-logs:
+	KUBECONFIG=.floci/kubeconfig kubectl -n triage logs -l app=triage-agent --tail=50 -f
+
+triage-eval:
+	. agents/.venv/bin/activate && KUBECONFIG=.floci/kubeconfig python3 agents/eval/run_eval.py

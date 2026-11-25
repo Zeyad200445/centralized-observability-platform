@@ -138,7 +138,24 @@ prometheus-node-exporter:
     targetPort: {{ node_exporter_port }}
 
   hostRootFsMount:
-    enabled: {{ 'false' if is_emulated else 'true' }}
+    enabled: {{ 'true' if (not is_emulated or triage_agent_enabled) else 'false' }}
+{% if triage_agent_enabled %}
+  config:
+    route:
+      receiver: 'null'
+      group_wait: 15s
+      group_interval: 1m
+      repeat_interval: 10m
+      routes:
+        - receiver: 'triage-agent'
+          continue: true
+    receivers:
+      - name: 'null'
+      - name: 'triage-agent'
+        webhook_configs:
+          - url: 'http://triage-agent.{{ triage_namespace }}.svc:8080/alert'
+            send_resolved: false
+{% endif %}
     mountPropagation: HostToContainer
 
   # /proc and /sys are the whole point of this exporter.

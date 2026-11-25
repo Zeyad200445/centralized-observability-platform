@@ -49,3 +49,4 @@ vault-password*
 *.swo
 .DS_Store
 Thumbs.db
+agents/.venv/
