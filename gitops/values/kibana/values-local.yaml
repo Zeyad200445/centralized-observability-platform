@@ -1,0 +1,64 @@
+# values-local.yaml - kibana
+# Converted from ansible/templates/elk-values.yml.j2 (Jinja2 resolved with is_emulated=true).
+# Do not put credentials here: they come from SealedSecrets.
+
+# ===========================================================================
+# 3. KIBANA - Deployment + Service on 5601
+# ===========================================================================
+elasticsearchSecurity:
+  auth:
+    useServiceAccountToken: false
+elasticsearchHosts: "http://elasticsearch-master.logging.svc:9200"
+
+replicas: 1
+
+image: docker.elastic.co/kibana/kibana
+imageTag: "8.5.1"
+imagePullPolicy: IfNotPresent
+
+protocol: http
+httpPort: 5601
+
+# Credentials come from the Ansible-created Secret, never from values.
+extraEnvs:
+  - name: KIBANA_ENCRYPTION_KEY
+    valueFrom:
+      secretKeyRef:
+        name: "kibana-credentials"
+        key: encryptionkey
+  - name: NODE_OPTIONS
+    value: "--max-old-space-size=512"
+
+kibanaConfig:
+  kibana.yml: |
+    server.name: kibana
+    server.host: "0.0.0.0"
+    server.publicBaseUrl: "http://localhost:5601"
+    elasticsearch.hosts: ["http://elasticsearch-master.logging.svc:9200"]
+    elasticsearch.requestTimeout: 90000
+    # Stable key: regenerating it on every restart orphans saved objects.
+    xpack.encryptedSavedObjects.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"
+    xpack.reporting.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"
+    xpack.security.encryptionKey: "${KIBANA_ENCRYPTION_KEY}"
+    monitoring.ui.container.elasticsearch.enabled: true
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "512Mi"
+  limits:
+    cpu: "1000m"
+    memory: "2Gi"
+
+service:
+  type: ClusterIP
+  port: 5601
+
+healthCheckPath: "/app/kibana"
+
+readinessProbe:
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 30
+  successThreshold: 1

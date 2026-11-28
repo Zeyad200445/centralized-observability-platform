@@ -1,0 +1,27 @@
+# Sync wave 2: Logstash after Elasticsearch is Healthy.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: logstash
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    - repoURL: https://helm.elastic.co
+      chart: logstash
+      targetRevision: "{{ .Values.elasticStackVersion }}"
+      helm:
+        releaseName: logstash
+        valueFiles:
+          - $values/gitops/values/logstash/values-{{ .Values.env }}.yaml
+    - repoURL: {{ .Values.repoURL }}
+      targetRevision: {{ .Values.targetRevision }}
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: logging
+  {{- include "obs.syncPolicy" . | nindent 2 }}

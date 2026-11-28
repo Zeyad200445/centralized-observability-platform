@@ -1,0 +1,22 @@
+# Sync wave 0: namespaces, quota, ServiceAccounts, RBAC and SealedSecrets.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-base
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL }}
+    targetRevision: {{ .Values.targetRevision }}
+    path: gitops/manifests/platform-base/{{ .Values.env }}
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: logging
+  {{- include "obs.syncPolicy" . | nindent 2 }}

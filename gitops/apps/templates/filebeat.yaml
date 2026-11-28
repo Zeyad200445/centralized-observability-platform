@@ -1,0 +1,27 @@
+# Sync wave 3: Filebeat after Logstash (ships to logstash:5044).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: filebeat
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    - repoURL: https://helm.elastic.co
+      chart: filebeat
+      targetRevision: "{{ .Values.elasticStackVersion }}"
+      helm:
+        releaseName: filebeat
+        valueFiles:
+          - $values/gitops/values/filebeat/values-{{ .Values.env }}.yaml
+    - repoURL: {{ .Values.repoURL }}
+      targetRevision: {{ .Values.targetRevision }}
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: logging
+  {{- include "obs.syncPolicy" . | nindent 2 }}

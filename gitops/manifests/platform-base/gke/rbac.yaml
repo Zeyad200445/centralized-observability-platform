@@ -1,0 +1,62 @@
+# ServiceAccounts + read-only ClusterRole (from ansible/playbook.yml).
+# Charts run with managedServiceAccount/serviceAccount.create=false and use these.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: obs-prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: obs-filebeat
+  namespace: logging
+  labels:
+    app.kubernetes.io/name: filebeat
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: obs-cluster-reader
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, nodes/metrics, pods, services, endpoints]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [namespaces, configmaps, secrets, events, persistentvolumes, persistentvolumeclaims]
+    verbs: [get, list, watch]
+  - apiGroups: ["apps"]
+    resources: [deployments, daemonsets, replicasets, statefulsets]
+    verbs: [get, list, watch]
+  - apiGroups: ["batch"]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: [nodes, pods]
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: obs-cluster-reader-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: obs-cluster-reader
+subjects:
+  - kind: ServiceAccount
+    name: obs-prometheus
+    namespace: monitoring
+  - kind: ServiceAccount
+    name: obs-filebeat
+    namespace: logging

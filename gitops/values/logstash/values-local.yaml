@@ -1,0 +1,259 @@
+# values-local.yaml - logstash
+# Converted from ansible/templates/elk-values.yml.j2 (Jinja2 resolved with is_emulated=true).
+# Do not put credentials here: they come from SealedSecrets.
+
+# ===========================================================================
+# 2. LOGSTASH - Deployment + ClusterIP Service on 5044
+#
+# The heart of the logging pipeline: input -> filter -> output.
+# ===========================================================================
+fullnameOverride: "logstash"
+
+replicas: 1
+
+image: docker.elastic.co/logstash/logstash
+imageTag: "8.5.1"
+imagePullPolicy: IfNotPresent
+
+logstashJavaOpts: "-Xms256m -Xmx512m"
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "512Mi"
+  limits:
+    cpu: "500m"
+    memory: "1Gi"
+
+extraEnvs:
+  - name: ELASTICSEARCH_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: logstash-es-credentials
+        key: username
+  - name: ELASTICSEARCH_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: logstash-es-credentials
+        key: password
+
+livenessProbe:
+  httpGet: null
+  tcpSocket:
+    port: 5044
+  initialDelaySeconds: 120
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+readinessProbe:
+  httpGet: null
+  tcpSocket:
+    port: 5044
+  initialDelaySeconds: 45
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+# ---- Service: this is what Filebeat ships to --------------------------
+service:
+  type: ClusterIP
+  ports:
+    - name: beats
+      port: 5044
+      protocol: TCP
+      targetPort: 5044
+    - name: http
+      port: 9600
+      protocol: TCP
+      targetPort: 9600
+
+# A small persistent queue absorbs Elasticsearch restarts without dropping
+# log lines on the floor.
+persistence:
+  enabled: true
+
+volumeClaimTemplate:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: "local-path"
+  resources:
+    requests:
+      storage: "2Gi"
+
+logstashConfig:
+  logstash.yml: |
+    http.host: "0.0.0.0"
+    http.port: 9600
+    pipeline.workers: 2
+    pipeline.batch.size: 250
+    pipeline.batch.delay: 50
+    # Disk-backed queue: survives a pod restart mid-flight.
+    queue.type: persisted
+    queue.max_bytes: 1gb
+    log.level: info
+
+logstashPipeline:
+  logstash.conf: |
+    # =================================================================
+    # INPUT - Beats protocol. Filebeat DaemonSets connect here on 5044.
+    # =================================================================
+    input {
+      beats {
+        port => 5044
+        client_inactivity_timeout => 300
+      }
+    }
+
+    # =================================================================
+    # FILTER - turn one opaque text line into typed, queryable fields.
+    # =================================================================
+    filter {
+
+      # Keep a verbatim copy BEFORE any mutation. If a grok pattern fails
+      # we still want the original line searchable rather than lost.
+      mutate {
+        add_field => { "raw_message" => "%{message}" }
+      }
+
+      # ---- NGINX access logs ----------------------------------------
+      # Combined log format:
+      #   10.1.2.3 - - [12/Nov/2026:08:15:42 +0000] "GET /path HTTP/1.1" 200 612 "-" "curl/8.4.0"
+      if [kubernetes][container][name] == "nginx"
+         or [kubernetes][labels][app] == "nginx-demo"
+         or [message] =~ /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} - / {
+
+        grok {
+          match => {
+            "message" => [
+              "%{IPORHOST:client_ip} - %{DATA:remote_user} \[%{HTTPDATE:timestamp}\] \"%{WORD:http_method} %{DATA:request_path} HTTP/%{NUMBER:http_version}\" %{NUMBER:http_status:int} %{NUMBER:bytes_sent:int} \"%{DATA:http_referer}\" \"%{DATA:user_agent}\"( \"%{DATA:x_forwarded_for}\")?",
+              "%{IPORHOST:client_ip} - %{DATA:remote_user} \[%{HTTPDATE:timestamp}\] \"%{WORD:http_method} %{DATA:request_path} HTTP/%{NUMBER:http_version}\" %{NUMBER:http_status:int} %{NUMBER:bytes_sent:int}"
+            ]
+          }
+          tag_on_failure => ["_grok_nginx_access_failure"]
+        }
+
+        # ---- NGINX error logs ---------------------------------------
+        if "_grok_nginx_access_failure" in [tags] {
+          grok {
+            match => {
+              "message" => "%{DATESTAMP:timestamp} \[%{LOGLEVEL:log_level}\] %{POSINT:pid}#%{NUMBER:tid}: %{GREEDYDATA:error_detail}"
+            }
+            tag_on_failure => ["_grok_nginx_error_failure"]
+          }
+        }
+
+        # Normalise the event timestamp to the one IN the log line, not
+        # the time Filebeat happened to read it. Without this, a backlog
+        # replay would stack every old line onto "now".
+        if [timestamp] {
+          date {
+            match => [
+              "timestamp",
+              "dd/MMM/yyyy:HH:mm:ss Z",
+              "yy/MM/dd HH:mm:ss",
+              "ISO8601"
+            ]
+            target => "@timestamp"
+            remove_field => ["timestamp"]
+            tag_on_failure => ["_dateparsefailure"]
+          }
+        }
+
+        # Derive a log_level from the status class so NGINX access lines
+        # are filterable next to application logs in the same Kibana view.
+        if [http_status] {
+          if [http_status] >= 500 {
+            mutate { add_field => { "log_level" => "ERROR" } }
+          } else if [http_status] >= 400 {
+            mutate { add_field => { "log_level" => "WARN" } }
+          } else {
+            mutate { add_field => { "log_level" => "INFO" } }
+          }
+        }
+
+        # Split /path?a=1 so the path is a clean aggregation key.
+        if [request_path] {
+          grok {
+            match => { "request_path" => "%{URIPATH:request_uri}(?:%{URIPARAM:request_params})?" }
+            tag_on_failure => []
+          }
+        }
+      }
+
+      # ---- Generic application logs ---------------------------------
+      # Anything that is not NGINX: pull out a severity so dashboards can
+      # count ERROR/WARN across every microservice uniformly.
+      else {
+        grok {
+          match => {
+            "message" => [
+              "%{TIMESTAMP_ISO8601:timestamp}%{SPACE}\[?%{LOGLEVEL:log_level}\]?%{SPACE}%{GREEDYDATA:log_detail}",
+              "%{LOGLEVEL:log_level}%{SPACE}%{GREEDYDATA:log_detail}"
+            ]
+          }
+          tag_on_failure => ["_grok_app_failure"]
+        }
+
+        if [timestamp] {
+          date {
+            match => ["timestamp", "ISO8601", "yyyy-MM-dd HH:mm:ss,SSS", "yyyy-MM-dd HH:mm:ss"]
+            target => "@timestamp"
+            remove_field => ["timestamp"]
+            tag_on_failure => ["_dateparsefailure"]
+          }
+        }
+
+        # Unparsed lines still get a level so no document is untyped.
+        if ![log_level] {
+          mutate { add_field => { "log_level" => "INFO" } }
+        }
+      }
+
+      # ---- Normalisation applied to every event ---------------------
+      mutate {
+        uppercase => ["log_level"]
+        # Flatten the Kubernetes metadata Filebeat attached into short,
+        # memorable field names. Kibana users should not have to type
+        # kubernetes.pod.name five levels deep.
+        rename => {
+          "[kubernetes][pod][name]"       => "[kubernetes][pod]"
+          "[kubernetes][namespace]"       => "[kubernetes][namespace]"
+          "[kubernetes][container][name]" => "[kubernetes][container]"
+          "[kubernetes][node][name]"      => "[kubernetes][node]"
+        }
+        remove_field => ["agent", "ecs", "input", "stream", "host"]
+      }
+
+      # Index-routing metadata: one index per day keeps shards small and
+      # makes retention a matter of deleting whole indices.
+      mutate {
+        add_field => {
+          "[@metadata][index_prefix]" => "logstash-k8s"
+        }
+      }
+    }
+
+    # =================================================================
+    # OUTPUT - structured JSON documents into Elasticsearch over 9200.
+    # =================================================================
+    output {
+      elasticsearch {
+        hosts  => ["http://elasticsearch-master.logging.svc:9200"]
+        user   => "${ELASTICSEARCH_USERNAME}"
+        password => "${ELASTICSEARCH_PASSWORD}"
+        index  => "logstash-k8s-%{+YYYY.MM.dd}"
+        ssl => false
+        # An explicit template so http_status is a long and client_ip is an
+        # ip, not a string. Without it Kibana cannot do range filters or
+        # geo lookups on them.
+        manage_template => true
+        template_name => "logstash-k8s"
+        template_overwrite => true
+        action => "create"
+        data_stream => false
+      }
+
+      # Local only: mirrors every document to the pod log so a failing
+      # pipeline can be debugged with `kubectl logs` and no Kibana.
+      stdout { codec => rubydebug { metadata => false } }
+    }

@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# Root Application (App-of-Apps).
+#
+# The ONLY object Ansible applies. It renders the Helm chart in gitops/apps,
+# whose templates are the child Applications. Everything else is Argo CD
+# pulling from git.
+#
+# Switch environment with the `env` parameter: local (k3s) | gke.
+# After merging to main, change targetRevision (here and in apps/values.yaml).
+# ---------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Zeyad200445/centralized-observability-platform.git
+    targetRevision: feat/gitops-argocd
+    path: gitops/apps
+    helm:
+      parameters:
+        - name: env
+          value: local
+        - name: targetRevision
+          value: feat/gitops-argocd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      selfHeal: true
+      prune: true
+    syncOptions:
+      - CreateNamespace=true

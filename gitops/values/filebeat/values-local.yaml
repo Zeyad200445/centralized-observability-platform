@@ -1,0 +1,160 @@
+# values-local.yaml - filebeat
+# Converted from ansible/templates/elk-values.yml.j2 (Jinja2 resolved with is_emulated=true).
+# Do not put credentials here: they come from SealedSecrets.
+
+# ===========================================================================
+# 4. FILEBEAT - DaemonSet, exactly one pod per node
+# ===========================================================================
+extraInitContainers: |
+  - name: clear-stale-lock
+    image: busybox:1.36
+    command: ["sh", "-c", "rm -f /usr/share/filebeat/data/filebeat.lock"]
+    volumeMounts:
+      - name: data
+        mountPath: /usr/share/filebeat/data
+daemonset:
+  enabled: true
+
+  # Use the ServiceAccount Ansible created and bound to obs-cluster-reader,
+  # instead of letting the chart invent its own RBAC.
+  annotations: {}
+  labels:
+    app.kubernetes.io/part-of: elk
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  # Filebeat must read the node's log directory, which is root-owned.
+  securityContext:
+    runAsUser: 0
+    privileged: false
+
+  extraEnvs:
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+    - name: POD_NAMESPACE
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
+
+  # hostPath mounts: this is how a container reads the node's disk.
+  # /var/log/containers holds symlinks into /var/log/pods, so BOTH are
+  # required - mounting only the first yields dangling symlinks.
+  extraVolumes:
+    - name: varlogcontainers
+      hostPath:
+        path: /var/log/containers
+        type: DirectoryOrCreate
+    - name: varlogpods
+      hostPath:
+        path: /var/log/pods
+        type: DirectoryOrCreate
+
+  extraVolumeMounts:
+    - name: varlogcontainers
+      mountPath: /var/log/containers
+      readOnly: true
+    - name: varlogpods
+      mountPath: /var/log/pods
+      readOnly: true
+  # Tolerate control-plane taints so the DaemonSet really is on EVERY node.
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+
+  filebeatConfig:
+    filebeat.yml: |
+      # ---- INPUT: tail every container log file on this node ----------
+      filebeat.inputs:
+        - type: container
+          enabled: true
+          paths:
+            - /var/log/containers/*.log
+          # Containerd/CRI writes partial lines when output exceeds 16KB.
+          parsers:
+            - container:
+                stream: all
+                format: auto
+          processors:
+            # Attach pod name, namespace, labels, node. This is what makes
+            # a log line attributable to a workload instead of to a file.
+            - add_kubernetes_metadata:
+                host: "${NODE_NAME}"
+                default_indexers.enabled: true
+                default_matchers.enabled: true
+                matchers:
+                  - logs_path:
+                      logs_path: "/var/log/containers/"
+            # Never ship our own pipeline's logs back into the pipeline.
+            - drop_event:
+                when:
+                  or:
+                    - equals:
+                        kubernetes.namespace: "logging"
+                    - equals:
+                        kubernetes.namespace: "kube-system"
+          # Multiline: fold Java/Python stack traces into one event rather
+          # than 40 orphaned lines.
+          multiline:
+            type: pattern
+            pattern: '^[[:space:]]+(at|\.{3})[[:space:]]+\b|^Caused by:'
+            negate: false
+            match: after
+            max_lines: 500
+            timeout: 5s
+
+      # ---- PROCESSORS applied to every event --------------------------
+      processors:
+        - add_host_metadata:
+            when.not.contains.tags: forwarded
+        - add_cloud_metadata: ~
+        - add_fields:
+            target: ''
+            fields:
+              cluster: "obs-gke"
+              environment: "local"
+
+      # ---- OUTPUT: Logstash over the beats protocol on 5044 -----------
+      # NOT straight to Elasticsearch: the whole point of the Logstash hop
+      # is Grok parsing. Bypassing it would store opaque text blobs.
+      output.logstash:
+        hosts: ["logstash.logging.svc:5044"]
+        loadbalance: true
+        # Back-pressure settings: retry forever rather than drop logs.
+        max_retries: -1
+        bulk_max_size: 2048
+        slow_start: true
+        ttl: 30s
+
+      # Filebeat's own health, visible via `kubectl logs`.
+      logging.level: info
+      logging.to_files: false
+
+      http.enabled: true
+      http.host: 0.0.0.0
+      http.port: 5066
+
+# The chart would otherwise create a second, competing ServiceAccount and
+# ClusterRole. Ansible owns those (see the RBAC tasks in playbook.yml).
+managedServiceAccount: false
+serviceAccount: "obs-filebeat"
+
+# One Filebeat per node is enough; the Deployment variant would duplicate
+# every log line.
+deployment:
+  enabled: false
+
+image: docker.elastic.co/beats/filebeat
+imageTag: "8.5.1"
+imagePullPolicy: IfNotPresent

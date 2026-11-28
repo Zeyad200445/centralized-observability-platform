@@ -1,0 +1,47 @@
+# Namespaces + workload quota (from ansible/playbook.yml)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workload
+  labels:
+    name: workload
+    platform: centralized-observability
+    observability-role: workload
+  annotations:
+    platform.observability/purpose: "Application microservices under observation"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+  labels:
+    name: logging
+    platform: centralized-observability
+    observability-role: logging
+  annotations:
+    platform.observability/purpose: "ELK logging pipeline: Filebeat, Logstash, Elasticsearch, Kibana"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    name: monitoring
+    platform: centralized-observability
+    observability-role: monitoring
+  annotations:
+    platform.observability/purpose: "Metrics pipeline: Prometheus, Grafana, exporters"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: workload-quota
+  namespace: workload
+spec:
+  hard:
+    requests.cpu: "16"
+    requests.memory: "32Gi"
+    limits.cpu: "32"
+    limits.memory: "64Gi"
+    pods: "100"

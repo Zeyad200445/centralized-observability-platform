@@ -1,0 +1,365 @@
+# ===========================================================================
+# gcp-exporter.yml.j2  ->  ansible/rendered/gcp-exporter.yml
+#
+# The GCP Stackdriver exporter: the one component that reaches OUTSIDE the
+# cluster. It calls the Google Cloud Monitoring API, pulls time series for
+# GCS buckets, load balancers and GKE infrastructure, and re-publishes them
+# in Prometheus exposition format on :9255/metrics.
+#
+# Deployed as raw manifests rather than a Helm chart because the three things
+# that actually matter here - the Workload Identity annotation, the
+# ServiceMonitor, and degrading gracefully under the emulator - are all
+# clearer written out than expressed as chart value overrides.
+#
+# AUTHENTICATION, and why there is no key file anywhere in this repo:
+#
+#   1. modules/iam created obs-gcp-exporter-sa with roles/monitoring.viewer
+#   2. modules/iam bound roles/iam.workloadIdentityUser so that
+#      serviceAccount:PROJECT.svc.id.goog[monitoring/gcp-exporter-sa]
+#      may impersonate it
+#   3. playbook.yml annotated the Kubernetes SA with
+#      iam.gke.io/gcp-service-account
+#   4. at runtime the pod asks the GKE metadata server for a token; the
+#      metadata server validates the binding and mints a short-lived one
+#
+# A leaked pod gets a token that expires in an hour and can only read
+# metrics. A leaked JSON key would be valid until someone noticed.
+# ===========================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gcp-exporter-sa
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: gcp-stackdriver-exporter
+---
+# ---------------------------------------------------------------------------
+# ConfigMap: which metrics to pull.
+#
+# Each prefix is a separate ListTimeSeries call per scrape. The Monitoring
+# API bills per call and rate-limits aggressively, so this list is the main
+# cost and latency lever on the whole metrics pipeline. Keep it tight.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gcp-stackdriver-exporter-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: gcp-stackdriver-exporter
+    app.kubernetes.io/part-of: monitoring
+    managed-by: ansible
+data:
+  monitoring-prefixes: |
+    compute.googleapis.com/instance/cpu
+    compute.googleapis.com/instance/disk
+    compute.googleapis.com/instance/network
+    storage.googleapis.com/api
+    storage.googleapis.com/storage
+    loadbalancing.googleapis.com/https
+    kubernetes.io/node
+    kubernetes.io/container
+  project-id: "obs-local"
+  scrape-interval: "5m"
+  adc.json: |
+    {
+      "type": "authorized_user",
+      "client_id": "floci-local-client-id",
+      "client_secret": "floci-local-client-secret",
+      "refresh_token": "floci-local-refresh-token"
+    }
+
+---
+# ---------------------------------------------------------------------------
+# Deployment: the exporter itself, port 9255.
+#
+# Single replica on purpose. Two replicas would double the Monitoring API
+# call volume and produce duplicate series that Prometheus would have to
+# deduplicate by external label - all cost, no availability benefit, since a
+# missed 5-minute scrape of slow-moving cloud metrics is not an outage.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-stackdriver-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: gcp-stackdriver-exporter
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/part-of: monitoring
+    managed-by: ansible
+  annotations:
+    platform.observability/purpose: >-
+      Pulls external GCP service metrics from the Cloud Monitoring API and
+      exposes them to Prometheus.
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gcp-stackdriver-exporter
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gcp-stackdriver-exporter
+        app.kubernetes.io/component: exporter
+        app.kubernetes.io/part-of: monitoring
+      annotations:
+        # Redundant with the ServiceMonitor below, but it means the exporter
+        # is still scraped if someone ever removes the Prometheus Operator.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9255"
+        prometheus.io/path: "/metrics"
+        # Forces a rollout when the metric prefix list changes; without it a
+        # ConfigMap edit would sit unread until the next unrelated restart.
+        checksum/config: "f4b3d4c4b95d3f192329bd9fbc544899e8752dd2"
+    spec:
+      # THE Workload Identity link. This SA carries the
+      # iam.gke.io/gcp-service-account annotation set in playbook.yml.
+      serviceAccountName: gcp-exporter-sa
+      automountServiceAccountToken: true
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: stackdriver-exporter
+          image: "prometheuscommunity/stackdriver-exporter:v0.18.0"
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - "--google.project-ids=obs-local"
+            - "--monitoring.metrics-type-prefixes=compute.googleapis.com/instance/cpu,compute.googleapis.com/instance/disk,compute.googleapis.com/instance/network,storage.googleapis.com/api,storage.googleapis.com/storage,loadbalancing.googleapis.com/https,kubernetes.io/node,kubernetes.io/container"
+            # Look back far enough to catch the Monitoring API's ingestion
+            # delay (GCP publishes most series 3-4 minutes late), but not so
+            # far that every scrape re-reads the same points.
+            - "--monitoring.metrics-interval=5m"
+            - "--monitoring.metrics-ingest-delay"
+            - "--web.listen-address=:9255"
+            - "--web.telemetry-path=/metrics"
+            # floci-gcp emulates the Monitoring API surface but holds no real
+            # time series. Pointing the exporter at the emulator keeps the
+            # target UP and the pipeline shape identical, while the data is
+            # understood to be empty locally.
+            - "--monitoring.drop-delegated-projects"
+
+          ports:
+            - name: metrics
+              containerPort: 9255
+              protocol: TCP
+
+          env:
+            - name: GOOGLE_PROJECT_ID
+              value: "obs-local"
+            # Local: talk to the emulator over plain HTTP with a stub token.
+            # The Google client libraries honour these two variables, so no
+            # code change is needed between environments.
+            - name: STACKDRIVER_EMULATOR_HOST
+              value: "floci-gcp:4588"
+            - name: GOOGLE_API_USE_CLIENT_CERTIFICATE
+              value: "false"
+            - name: GOOGLE_OAUTH_ACCESS_TOKEN
+              value: "floci-mock-access-token"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: "/etc/stackdriver-exporter/adc.json"
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 5
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/stackdriver-exporter
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: config
+          configMap:
+            name: gcp-stackdriver-exporter-config
+        # readOnlyRootFilesystem: true means the process still needs a
+        # writable scratch directory somewhere.
+        - name: tmp
+          emptyDir: {}
+
+      # Keep the exporter off nodes reserved for stateful log storage.
+      tolerations: []
+      nodeSelector: {}
+
+---
+# ---------------------------------------------------------------------------
+# Service: stable ClusterIP endpoint for Prometheus to scrape.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: gcp-stackdriver-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: gcp-stackdriver-exporter
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/part-of: monitoring
+    managed-by: ansible
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gcp-stackdriver-exporter
+  ports:
+    - name: metrics
+      port: 9255
+      targetPort: metrics
+      protocol: TCP
+
+---
+# ---------------------------------------------------------------------------
+# ServiceMonitor: tells the Prometheus Operator to scrape the Service above.
+#
+# This is picked up because monitoring-values.yml.j2 sets
+# serviceMonitorSelectorNilUsesHelmValues: false, which makes Prometheus
+# adopt every ServiceMonitor in the cluster instead of only those labelled
+# with the kube-prometheus-stack release name.
+#
+# The 5m interval deliberately breaks the global 15s rule: Cloud Monitoring
+# publishes most series at 1-minute granularity at best, and scraping every
+# 15s would quadruple the API bill to re-read identical points.
+# ---------------------------------------------------------------------------
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gcp-stackdriver-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: gcp-stackdriver-exporter
+    app.kubernetes.io/part-of: monitoring
+    release: kube-prometheus-stack
+    managed-by: ansible
+spec:
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gcp-stackdriver-exporter
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 5m
+      # Monitoring API round trips are slow; a 10s timeout would mark a
+      # healthy exporter as down.
+      scrapeTimeout: 60s
+      honorLabels: true
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - targetLabel: job
+          replacement: gcp-stackdriver-exporter
+        - targetLabel: gcp_project
+          replacement: "obs-local"
+
+---
+# ---------------------------------------------------------------------------
+# PodDisruptionBudget: keeps a voluntary node drain from taking external
+# metrics collection to zero while the replacement pod schedules.
+# ---------------------------------------------------------------------------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gcp-stackdriver-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: gcp-stackdriver-exporter
+    managed-by: ansible
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gcp-stackdriver-exporter
+
+---
+# ---------------------------------------------------------------------------
+# NetworkPolicy: the exporter talks to exactly two things - the Google
+# Monitoring API (egress 443) and Prometheus (ingress 9255). Nothing else in
+# the cluster has any business reaching it.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gcp-stackdriver-exporter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: gcp-stackdriver-exporter
+    managed-by: ansible
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gcp-stackdriver-exporter
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9255
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Google Cloud Monitoring API, and the GKE metadata server for tokens.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        # Local: the emulator listens on plain 4588.
+        - protocol: TCP
+          port: 4588

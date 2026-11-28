@@ -1,0 +1,8 @@
+# Overridden by root-app.yaml (helm.parameters).
+env: local            # local | gke
+repoURL: https://github.com/Zeyad200445/centralized-observability-platform.git
+targetRevision: feat/gitops-argocd
+
+# Pinned chart versions (from ansible/group_vars/all.yml).
+elasticStackVersion: "8.5.1"
+kubePrometheusStackVersion: "65.5.1"

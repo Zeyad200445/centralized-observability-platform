@@ -1,0 +1,126 @@
+# values-local.yaml - elasticsearch
+# Converted from ansible/templates/elk-values.yml.j2 (Jinja2 resolved with is_emulated=true).
+# Do not put credentials here: they come from SealedSecrets.
+
+# ===========================================================================
+# 1. ELASTICSEARCH - StatefulSet + PersistentVolumeClaim, port 9200
+# ===========================================================================
+clusterName: "elasticsearch"
+nodeGroup: master
+
+# منع الكونتينر إنه يدور على ماستر تاني لو إحنا شغالين محلي (Single Node)
+clusterInitialMasterNodes: ""
+
+# Every node is master+data+ingest. Splitting roles only pays off well
+# past the scale this platform targets.
+roles:
+  - master
+  - data
+  - data_content
+  - data_hot
+  - ingest
+  - remote_cluster_client
+
+replicas: 1
+minimumMasterNodes: 1
+
+image: docker.elastic.co/elasticsearch/elasticsearch
+imageTag: "8.5.1"
+imagePullPolicy: IfNotPresent
+
+esJavaOpts: "-Xms256m -Xmx256m"
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "512Mi"
+  limits:
+    cpu: "500m"
+    memory: "1Gi"
+
+# ---- Persistence -------------------------------------------------------
+# This is the PersistentVolumeClaim the brief requires. Without it a pod
+# restart loses every indexed document, which defeats the purpose of
+# centralizing logs at all.
+persistence:
+  enabled: true
+  labels:
+    enabled: true
+
+volumeClaimTemplate:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: "local-path"
+  resources:
+    requests:
+      storage: "10Gi"
+
+# ---- Security ----------------------------------------------------------
+# secret.enabled: false because Ansible already created
+# `elasticsearch-master-credentials`. Letting the chart generate its own
+# password would mean Logstash, Kibana and the smoke test all read a
+# credential nobody else knows.
+secret:
+  enabled: false
+
+createCert: false
+protocol: "http"
+httpPort: 9200
+transportPort: 9300
+
+extraEnvs:
+  - name: ELASTIC_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: "elasticsearch-master-credentials"
+        key: password
+  - name: ELASTIC_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: "elasticsearch-master-credentials"
+        key: username
+  - name: ELASTICSEARCH_YML_XPACK_SECURITY_HTTP_SSL_ENABLED
+    value: "false"
+
+esConfig:
+  elasticsearch.yml: |
+    cluster.name: "elasticsearch"
+    network.host: 0.0.0.0
+    xpack.security.enabled: true
+    xpack.security.autoconfiguration.enabled: false
+    xpack.security.enrollment.enabled: false
+    xpack.security.http.ssl.enabled: false
+    xpack.monitoring.collection.enabled: true
+    xpack.ml.enabled: false
+    # --- Local Environment (Docker/Floci) ---
+    # One replica, so nothing needs to reach port 9300. Keeping the transport
+    # on loopback makes Elasticsearch run in development mode, where the
+    # "transport SSL must be enabled" bootstrap check is only a warning.
+    # HTTP (9200) still listens on 0.0.0.0 for Kibana/Logstash.
+    transport.host: 127.0.0.1
+    xpack.security.transport.ssl.enabled: false
+
+# One k3s node cannot satisfy anti-affinity, and the single replica has no
+# peer to be anti-affine to anyway.
+antiAffinity: "soft"
+clusterHealthCheckParams: "wait_for_status=yellow&timeout=60s"
+# Elasticsearch refuses to start if vm.max_map_count < 262144. On GKE's COS
+# image the sysctl must be raised by a privileged init container.
+sysctlInitContainer:
+  enabled: true
+sysctlVmMaxMapCount: 262144
+
+readinessProbe:
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 10
+  successThreshold: 1
+
+service:
+  type: ClusterIP
+  httpPortName: http
+  transportPortName: transport
+
+podSecurityContext:
+  fsGroup: 1000
+  runAsUser: 1000

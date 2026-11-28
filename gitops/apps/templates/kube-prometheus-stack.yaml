@@ -1,0 +1,27 @@
+# Sync wave 4: Metrics stack; installs the CRDs (ServiceMonitor etc.) that gcp-exporter needs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: kube-prometheus-stack
+      targetRevision: "{{ .Values.kubePrometheusStackVersion }}"
+      helm:
+        releaseName: kube-prometheus-stack
+        valueFiles:
+          - $values/gitops/values/kube-prometheus-stack/values-{{ .Values.env }}.yaml
+    - repoURL: {{ .Values.repoURL }}
+      targetRevision: {{ .Values.targetRevision }}
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  {{- include "obs.syncPolicy" . | nindent 2 }}

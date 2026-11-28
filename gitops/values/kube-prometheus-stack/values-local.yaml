@@ -1,0 +1,517 @@
+# values-local.yaml - kube-prometheus-stack
+# Converted from ansible/templates/monitoring-values.yml.j2 (Jinja2 resolved with is_emulated=true).
+# Do not put credentials here: they come from SealedSecrets.
+
+# ===========================================================================
+# monitoring-values.yml.j2  ->  prometheus-community/kube-prometheus-stack
+#
+# One chart delivers four of the five metrics components the brief asks for:
+#
+#   Prometheus        StatefulSet + PVC, port 9090   (created by the Operator)
+#   Grafana           Deployment + Service, port 3000
+#   Node Exporter     DaemonSet, port 9100
+#   Kube State Metrics Deployment, port 8080
+#
+# The fifth, the GCP Stackdriver exporter, is deployed separately from
+# gcp-exporter.yml.j2 because it needs a Workload Identity annotation that no
+# chart value exposes cleanly.
+#
+# Rendered output: ansible/rendered/monitoring-values.yml
+# ===========================================================================
+
+fullnameOverride: "kube-prometheus-stack"
+
+# ===========================================================================
+# PROMETHEUS - the time-series database
+# ===========================================================================
+prometheus:
+  enabled: true
+
+  # The Operator turns this spec into a StatefulSet with a PVC, which is why
+  # no StatefulSet appears literally anywhere in this file.
+  prometheusSpec:
+    replicas: 1
+
+    # ---- THE 15s REQUIREMENT ------------------------------------------
+    scrapeInterval: "15s"
+    evaluationInterval: "30s"
+    scrapeTimeout: 10s
+
+    retention: "2d"
+    retentionSize: "8GB"
+
+    # ---- Service discovery --------------------------------------------
+    # By default the Operator only picks up ServiceMonitors carrying this
+    # Helm release's label. Setting these to false makes Prometheus adopt
+    # EVERY ServiceMonitor in the cluster - including the one that
+    # gcp-exporter.yml.j2 creates, and any a future microservice ships.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    # Watch all namespaces, not just `monitoring`.
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+
+    # Use the ServiceAccount Ansible created and bound to obs-cluster-reader.
+    serviceAccountName: "obs-prometheus"
+
+    externalLabels:
+      cluster: "obs-gke"
+      environment: "local"
+      project: "obs-local"
+
+    # ---- Storage: the PVC the brief requires ---------------------------
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: "local-path"
+          resources:
+            requests:
+              storage: "10Gi"
+
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+
+    securityContext:
+      runAsUser: 1000
+      runAsNonRoot: true
+      fsGroup: 2000
+
+    # ---- Additional scrape configs -------------------------------------
+    # Pod-annotation based discovery, so any workload that adds
+    #   prometheus.io/scrape: "true"
+    # is scraped with zero changes to this file. The NGINX test app uses it.
+    additionalScrapeConfigs:
+      - job_name: kubernetes-pods-annotated
+        scrape_interval: "15s"
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: node
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+
+  service:
+    type: ClusterIP
+    port: 9090
+    targetPort: 9090
+
+# ===========================================================================
+# NODE EXPORTER - DaemonSet on 9100
+#
+# Mounts the node's /proc and /sys so it can report real hardware/OS metrics
+# (CPU, memory, disk I/O, network) rather than the container's own view.
+# ===========================================================================
+nodeExporter:
+  enabled: true
+
+prometheus-node-exporter:
+  fullnameOverride: node-exporter
+
+  service:
+    port: 9100
+    targetPort: 9100
+
+  hostRootFsMount:
+    enabled: false
+    mountPropagation: HostToContainer
+
+  # /proc and /sys are the whole point of this exporter.
+  hostNetwork: true
+  hostPID: true
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+  tolerations:
+    - operator: Exists
+
+  prometheus:
+    monitor:
+      enabled: true
+      interval: "15s"
+      jobLabel: node-exporter
+
+# ===========================================================================
+# KUBE STATE METRICS - Deployment on 8080
+#
+# Does NOT measure hardware. It asks the API server about object STATE:
+# how many pods are Running, which are CrashLoopBackOff, are Deployment
+# replicas ready, what is each node's capacity.
+# ===========================================================================
+kubeStateMetrics:
+  enabled: true
+
+kube-state-metrics:
+  fullnameOverride: kube-state-metrics
+
+  service:
+    port: 8080
+
+  collectors:
+    - certificatesigningrequests
+    - configmaps
+    - cronjobs
+    - daemonsets
+    - deployments
+    - endpoints
+    - horizontalpodautoscalers
+    - ingresses
+    - jobs
+    - limitranges
+    - namespaces
+    - nodes
+    - persistentvolumeclaims
+    - persistentvolumes
+    - poddisruptionbudgets
+    - pods
+    - replicasets
+    - resourcequotas
+    - secrets
+    - services
+    - statefulsets
+
+  metricLabelsAllowlist:
+    - "pods=[*]"
+    - "deployments=[*]"
+    - "nodes=[*]"
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+  prometheus:
+    monitor:
+      enabled: true
+      interval: "15s"
+
+# ===========================================================================
+# GRAFANA - Deployment + Service on 3000
+# ===========================================================================
+grafana:
+  # Elasticsearch datasource password injected from a SealedSecret (never in git).
+  envValueFrom:
+    ELASTIC_PASSWORD:
+      secretKeyRef:
+        name: grafana-es-credentials
+        key: password
+  enabled: true
+  fullnameOverride: "kube-prometheus-stack-grafana"
+
+  replicas: 1
+
+  # ---- Credentials ----------------------------------------------------
+  # The password lives in the Ansible-created Secret. Putting
+  # `adminPassword:` here would write it into the Helm release Secret in
+  # plaintext, where anyone with `helm get values` can read it.
+  admin:
+    existingSecret: "grafana-admin-credentials"
+    userKey: admin-user
+    passwordKey: admin-password
+
+  # ---- Persistence ----------------------------------------------------
+  persistence:
+    enabled: true
+    type: pvc
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: "local-path"
+    size: "5Gi"
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 3000
+
+  grafana.ini:
+    server:
+      root_url: "http://localhost:3000"
+    analytics:
+      check_for_updates: false
+      reporting_enabled: false
+    users:
+      allow_sign_up: false
+      default_theme: dark
+    auth.anonymous:
+      enabled: false
+    log:
+      mode: console
+      level: info
+
+  # ---- Data sources ---------------------------------------------------
+  # Provisioned declaratively so a fresh Grafana pod is immediately useful.
+  # No one should ever click "Add data source" on this platform.
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          uid: prometheus
+          access: proxy
+          url: "http://kube-prometheus-stack-prometheus.monitoring.svc:9090"
+          isDefault: false
+          jsonData:
+            timeInterval: "15s"
+            httpMethod: POST
+        # Lets Grafana query the ELK indices too, so a single pane shows the
+        # metric spike and the log lines that explain it.
+        - name: Elasticsearch
+          type: elasticsearch
+          uid: elasticsearch
+          access: proxy
+          url: "http://elasticsearch-master.logging.svc:9200"
+          database: "logstash-k8s-*"
+          basicAuth: true
+          basicAuthUser: "elastic"
+          secureJsonData:
+            basicAuthPassword: "$__env{ELASTIC_PASSWORD}"   # from SealedSecret grafana-es-credentials
+          jsonData:
+            esVersion: "8.0.0"
+            timeField: "@timestamp"
+            logMessageField: raw_message
+            logLevelField: log_level
+
+  # ---- Dashboards -----------------------------------------------------
+  # The upstream Kubernetes/Node dashboard set, pre-loaded.
+  defaultDashboardsEnabled: true
+  defaultDashboardsTimezone: utc
+
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: observability
+          orgId: 1
+          folder: Observability
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/observability
+
+  # Pulled from grafana.com at pod start, pinned by revision.
+  dashboards:
+    observability:
+      node-exporter-full:
+        gnetId: 1860
+        revision: 37
+        datasource: Prometheus
+      kubernetes-cluster:
+        gnetId: 7249
+        revision: 1
+        datasource: Prometheus
+      kube-state-metrics:
+        gnetId: 13332
+        revision: 12
+        datasource: Prometheus
+      nginx-overview:
+        gnetId: 12708
+        revision: 1
+        datasource: Prometheus
+
+  # Extra dashboards can be delivered as ConfigMaps labelled
+  # grafana_dashboard and the sidecar below will pick them up.
+  #
+  # CAUTION when adding inline dashboard JSON to this template: Grafana's
+  # legendFormat syntax collides with Jinja2's expression delimiters, so any
+  # legend such as the double-brace pod placeholder must be wrapped in a
+  # Jinja raw block or Ansible will try to resolve it as a variable and the
+  # render will fail. Shipping dashboards by gnetId above sidesteps this
+  # entirely, which is why that route is preferred here.
+  dashboardsConfigMaps: {}
+
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+    datasources:
+      enabled: true
+      searchNamespace: ALL
+
+# ===========================================================================
+# ALERTING
+# ===========================================================================
+alertmanager:
+  enabled: false
+  alertmanagerSpec:
+    replicas: 1
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: "local-path"
+          resources:
+            requests:
+              storage: 5Gi
+
+# Rules that matter for this platform specifically: if the logging pipeline
+# stops, nobody finds out from the logging pipeline.
+additionalPrometheusRulesMap:
+  observability-platform:
+    groups:
+      - name: observability-pipeline
+        rules:
+          - alert: FilebeatDown
+            expr: absent(up{job=~".*filebeat.*"} == 1)
+            for: 10m
+            labels:
+              severity: critical
+            annotations:
+              summary: No Filebeat instance is reporting
+              description: Container logs are no longer being shipped to Logstash.
+
+          - alert: LogstashNotIngesting
+            expr: absent(up{job=~".*logstash.*"} == 1)
+            for: 10m
+            labels:
+              severity: critical
+            annotations:
+              summary: Logstash is not reachable
+              description: The Grok parsing stage is down; logs are queueing at Filebeat.
+
+          - alert: ElasticsearchClusterUnhealthy
+            expr: elasticsearch_cluster_health_status{color="red"} == 1
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: Elasticsearch cluster is RED
+              description: At least one primary shard is unassigned; log ingestion may be failing.
+
+          - alert: GCPExporterDown
+            expr: up{job=~".*stackdriver.*|.*gcp.*"} == 0
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: GCP Stackdriver exporter is down
+              description: External GCP service metrics are no longer being collected.
+
+          - alert: WorkloadPodCrashLooping
+            expr: increase(kube_pod_container_status_restarts_total{namespace!="kube-system"}[15m]) > 3
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: A workload pod is crash looping
+              description: More than three restarts in fifteen minutes.
+
+# ===========================================================================
+# OPERATOR / CONTROL PLANE SCRAPING
+# ===========================================================================
+prometheusOperator:
+  enabled: true
+  admissionWebhooks:
+    enabled: true
+    patch:
+      enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# GKE and k3s both hide the control plane, so scraping these endpoints only
+# produces permanently-down targets and noisy alerts.
+kubeApiServer:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubelet:
+  enabled: true
+  serviceMonitor:
+    interval: "15s"
+    cAdvisor: true
+
+# CRDs are installed by the chart on first run.
+crds:
+  enabled: true
+
+# Default rules: keep the generic ones, drop the control-plane ones that
+# cannot fire on a managed cluster.
+defaultRules:
+  create: true
+  rules:
+    etcd: false
+    kubeControllerManager: false
+    kubeProxy: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubernetesSystem: true
+    node: true
+    general: true
+
+# Force string instead of list to fix the repeated flag error
+prometheus-stackdriver-exporter:
+  stackdriver:
+    metrics:
+      typePrefixes: 'compute.googleapis.com/instance/cpu'
+gcp-stackdriver-exporter:
+  stackdriver:
+    metrics:
+      typePrefixes: 'compute.googleapis.com/instance/cpu'
+
+gcp-stackdriver-exporter:
+  stackdriver:
+    metrics:
+      typePrefixes: []
+  extraArgs:
+    - --monitoring.metrics-type-prefixes=compute.googleapis.com/instance/cpu,compute.googleapis.com/instance/disk

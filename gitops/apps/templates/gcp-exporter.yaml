@@ -1,0 +1,20 @@
+# Sync wave 5: raw manifests (needs the ServiceMonitor CRD from wave 4).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gcp-exporter
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: {{ .Values.repoURL }}
+    targetRevision: {{ .Values.targetRevision }}
+    path: gitops/manifests/gcp-exporter/{{ .Values.env }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  {{- include "obs.syncPolicy" . | nindent 2 }}

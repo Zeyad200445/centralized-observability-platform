@@ -1,0 +1,27 @@
+# Sync wave 3: Kibana only needs Elasticsearch; runs alongside Filebeat.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kibana
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    - repoURL: https://helm.elastic.co
+      chart: kibana
+      targetRevision: "{{ .Values.elasticStackVersion }}"
+      helm:
+        releaseName: kibana
+        valueFiles:
+          - $values/gitops/values/kibana/values-{{ .Values.env }}.yaml
+    - repoURL: {{ .Values.repoURL }}
+      targetRevision: {{ .Values.targetRevision }}
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: logging
+  {{- include "obs.syncPolicy" . | nindent 2 }}
