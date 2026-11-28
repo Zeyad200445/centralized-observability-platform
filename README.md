@@ -666,3 +666,7 @@ make triage-build    # Build MCP & Agent images and import into k3s
 make triage-deploy   # Deploy Layer E via Ansible (-e triage_agent_enabled=true)
 make triage-logs     # Tail live JSON audit logs
 make triage-eval     # Run 4-fault injection evaluation harness
+
+### Layer E — Live Local Verification & Multi-Namespace Scope
+- **Multi-Namespace Read-Only Visibility:** The `kubernetes-mcp` server (`ClusterRole/obs-triage-reader`) inspects workloads, events, and pod statuses across all platform namespaces (`workload`, `logging`, `monitoring`, `triage`), while strictly denying access to `secrets`, `configmaps`, `kube-system`, and all mutating verbs.
+- **Verified Locally (`floci-gcp` + `k3s`):** Deployed end-to-end via `make triage-build && make triage-deploy` and validated against live firing alerts from `Alertmanager` (e.g., `PrometheusOperatorRejectedResources` triaged in **11.31s / 5 tool calls** with `medium` confidence and safe `kubectl` commands; `Watchdog` triaged in **9.93s / 1 tool call** with `high` confidence), persisting structured `TriageNote` reports (`.md` & `.json`) to `/data/triage`.

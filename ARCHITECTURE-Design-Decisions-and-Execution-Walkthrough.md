@@ -2361,3 +2361,9 @@ models is itself a useful result.
 single-node cluster. It does not show the agent handles novel failures, noisy
 multi-alert incidents, or adversarial log content. Section 2.11.5 is a design
 argument for the last of these, not a test of it.
+
+---
+
+### Update: Multi-Namespace Read-Only Scope & Local `k3s` Verification
+- **Scope Decision:** Expanded `Alert-Triage Agent` read-only inspection beyond `workload` to cover all observability and application namespaces (`workload`, `logging`, `monitoring`, `triage`). This enables the agent to diagnose platform-level incidents (such as `PrometheusOperatorRejectedResources` in `monitoring` or `Filebeat` issues in `logging`) while preserving least-privilege isolation (`kube-system`, `secrets`, `configmaps`, and write verbs remain blocked).
+- **Local Execution Proof:** Executed live on the local `floci-gcp` + `k3s` cluster. `Alertmanager` webhooks (`POST /alert`) triggered `triage-agent` automatically, confirming bounded tool execution (1–5 tool calls, well under the 8-call cap), non-hallucinated confidence calibration (`medium` when operator validation details required manual CRD inspection, `high` for `Watchdog`), and persistent report storage under `/data/triage`.
