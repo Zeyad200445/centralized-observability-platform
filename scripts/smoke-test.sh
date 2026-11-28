@@ -319,6 +319,49 @@ else
   fail "could not port-forward to ${PROM_SVC}"
 fi
 
+# ----------------------------------------------------------------- 7. Layer E (Triage Agent, optional)
+if kubectl get ns triage >/dev/null 2>&1; then
+  echo ""
+  echo "--- 7. Layer E: Read-Only Alert-Triage Agent ---"
+
+  for dep in prometheus-mcp elasticsearch-mcp kubernetes-mcp triage-agent; do
+    ready=$(kubectl -n triage get deploy "${dep}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+    [[ "${ready:-0}" -ge 1 ]] \
+      && pass "triage deployment '${dep}' is ready (${ready})" \
+      || fail "triage deployment '${dep}' is not ready"
+  done
+
+  # 7c. RBAC security assertions
+  [[ "$(kubectl auth can-i get pods --as=system:serviceaccount:triage:kubernetes-mcp -n workload 2>/dev/null)" == "yes" ]] \
+    && pass "RBAC: kubernetes-mcp can get pods in workload" \
+    || fail "RBAC: kubernetes-mcp cannot get pods in workload"
+
+  [[ "$(kubectl auth can-i get secrets --as=system:serviceaccount:triage:kubernetes-mcp -n workload 2>/dev/null)" == "no" ]] \
+    && pass "RBAC: kubernetes-mcp is blocked from reading secrets" \
+    || fail "RBAC: kubernetes-mcp can read secrets!"
+
+  [[ "$(kubectl auth can-i delete pods --as=system:serviceaccount:triage:kubernetes-mcp -n workload 2>/dev/null)" == "no" ]] \
+    && pass "RBAC: kubernetes-mcp is blocked from deleting pods" \
+    || fail "RBAC: kubernetes-mcp can delete pods!"
+
+  # 7b & 7f. /healthz and /metrics
+  kubectl -n triage port-forward svc/triage-agent 18080:8080 >/dev/null 2>&1 &
+  TRIAGE_PF=$!
+  sleep 2
+  if curl -sf http://127.0.0.1:18080/healthz | grep -q '"status":"ok"\|"status": "ok"'; then
+    pass "triage-agent /healthz reports all 3 MCP servers ok"
+  else
+    fail "triage-agent /healthz is degraded or unreachable"
+  fi
+
+  if curl -sf http://127.0.0.1:18080/metrics | grep -q 'triage_runs_total'; then
+    pass "triage-agent /metrics exposes Prometheus counters"
+  else
+    fail "triage-agent /metrics missing triage_runs_total"
+  fi
+  kill "${TRIAGE_PF}" 2>/dev/null || true
+fi
+
 # ----------------------------------------------------------------- summary
 echo ""
 echo "==========================================================="

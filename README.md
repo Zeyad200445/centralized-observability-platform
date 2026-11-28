@@ -24,6 +24,7 @@ changes are required.
 7. [Configuration reference](#7-configuration-reference)
 8. [Troubleshooting](#8-troubleshooting)
 9. [Teardown](#9-teardown)
+10. [Layer E — Read-Only SRE Alert-Triage Agent](#10-layer-e--read-only-sre-alert-triage-agent)
 
 ---
 
@@ -84,6 +85,10 @@ node /proc,/sys  -> Node Exporter DaemonSet :9100         --.
 Kubernetes API   -> Kube State Metrics Deployment :8080   --+-> Prometheus :9090 -> Grafana :3000
 Cloud Monitoring -> GCP Stackdriver Exporter :9255        --'   (StatefulSet + PVC, 15s scrape)
 ```
+
+### Layer E - Read-Only SRE Alert-Triage Agent (`triage` namespace, feature-flagged)
+
+Alertmanager Webhook -> `triage-agent` (FastAPI `:8080`, OpenAI Agents SDK + `gemini-3.5-flash-lite`) -> 3 read-only MCP servers (`prometheus-mcp:8001`, `elasticsearch-mcp:8002`, `kubernetes-mcp:8003`) -> PVC reports (`/data/triage`) + Prometheus `/metrics`. Off by default (`triage_agent_enabled: false`).
 
 ---
 
@@ -527,6 +532,10 @@ knobs:
 | `logstash_index_pattern` | `logstash-k8s` | Daily index becomes `logstash-k8s-YYYY.MM.dd` |
 | `gcp_exporter_metric_prefixes` | 8 prefixes | **Main cost driver.** Each prefix is one Monitoring API call per scrape |
 | `gcp_exporter_scrape_interval` | `5m` | Deliberately not 15s; see below |
+| `triage_agent_enabled` | `false` | Feature flag for Layer E (triage namespace, MCP servers, Alertmanager webhook) |
+| `triage_llm_model` | `gemini-3.5-flash-lite` | LLM model invoked via OpenAI-compatible endpoint |
+| `triage_max_tool_calls` | `8` | Hard cap on MCP tool calls per alert triage run |
+| `triage_cooldown_minutes` | `10` | Per-fingerprint deduplication window |
 
 ### Why the GCP exporter scrapes every 5 minutes, not 15 seconds
 
@@ -625,4 +634,35 @@ Terraform. Remove it by hand when you are certain:
 
 ```bash
 gsutil -m rm -r gs://$TF_BUCKET
+
+
 ```
+
+---
+
+## 10. Layer E — Read-Only SRE Alert-Triage Agent
+
+Layer E adds an autonomous, strictly **read-only** SRE triage service on top of the observability stack. When Alertmanager fires an alert, the agent correlates live metrics (Prometheus), structured logs (Elasticsearch), and cluster state/events (Kubernetes) through three isolated **MCP** servers, then outputs a structured `TriageNote` with evidence, root cause, confidence level, and safe read-only `kubectl` commands.
+
+### 10.1 Architecture & Pipeline
+- **Webhook & Queue (`POST /alert`):** Deduplicates firing alerts per `fingerprint` (`TRIAGE_COOLDOWN_MINUTES=10`) and processes them sequentially via `asyncio.Queue`.
+- **3 Read-Only MCP Servers:**
+  - `prometheus-mcp` (`:8001`): `query`, `query_range`, `get_alerts` (bounded to 500-char PromQL, 120m window, 25 series).
+  - `elasticsearch-mcp` (`:8002`): `search_logs` restricted to `logstash-k8s-*` and allowed namespaces (`workload`, `monitoring`).
+  - `kubernetes-mcp` (`:8003`): `get_workload_status`, `describe_pod`, `get_pod_logs` (4KB cap), `list_events`.
+- **Gemini 3.x Compatibility Hook:** An `httpx` request hook in `agents/triage-agent/app/agent.py` injects `extra_content.google.thought_signature = "skip_thought_signature_validator"` on assistant `tool_calls` so OpenAI Agents SDK multi-turn tool loops work seamlessly with Gemini 3.x.
+- **Outputs & Self-Metrics:** Writes `<fingerprint>.json` and `<fingerprint>.md` to a PVC (`/data/triage`), logs JSON audit summaries with SHA-256 hashes to `stdout`, and exposes `triage_runs_total`, `triage_duration_seconds`, and `triage_tool_calls_total` on `/metrics` via `ServiceMonitor`.
+
+### 10.2 Security & RBAC
+- **Feature-Flagged:** `triage_agent_enabled: false` by default in `ansible/group_vars/all.yml`.
+- **Least-Privilege RBAC:** `triage-agent`, `prometheus-mcp`, and `elasticsearch-mcp` set `automountServiceAccountToken: false`. Only `kubernetes-mcp` mounts a token bound to `ClusterRole/obs-triage-reader` (`get`/`list`/`watch` on pods, logs, events, services, and controllers — **no** `secrets`, **no** `configmaps`, **no** mutating verbs). `kube-system` is blocked at the MCP layer.
+- **Automated Verification:** Section 7 of `scripts/smoke-test.sh` verifies all 4 deployments, `/healthz`, `/metrics`, and `kubectl auth can-i` RBAC denials.
+
+### 10.3 Build, Deploy & Evaluate
+
+```bash
+export GEMINI_API_KEY="your-api-key"
+make triage-build    # Build MCP & Agent images and import into k3s
+make triage-deploy   # Deploy Layer E via Ansible (-e triage_agent_enabled=true)
+make triage-logs     # Tail live JSON audit logs
+make triage-eval     # Run 4-fault injection evaluation harness

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: eval-imagepull
+  namespace: workload
+  labels:
+    app: eval-imagepull
+spec:
+  containers:
+    - name: app
+      image: non-existent-registry.invalid/fake-app:v999
+      resources:
+        requests: { cpu: "10m", memory: "16Mi" }
+        limits:   { cpu: "50m", memory: "32Mi" }

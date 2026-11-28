@@ -1,13 +1,37 @@
 # Architecture, Design Decisions & Execution Walkthrough
 
 **Centralized Monitoring and Logging Infrastructure on Google Cloud Platform**
+**with Optional Layer E: Read-Only Alert-Triage Agent (MCP)**
 
 | | |
 |---|---|
 | **Prepared by** | Principal Cloud & DevOps Architect |
 | **Date** | 12 November 2026 |
-| **Status** | Implementation complete; statically validated |
-| **Scope** | `terraform/`, `ansible/`, `workloads/`, `scripts/`, root files |
+| **Revised** | 25 November 2026 (Layer E merged) |
+| **Status** | Layers A-D: implementation complete; statically validated. **Layer E: design specified, not yet implemented or verified** |
+| **Scope** | `terraform/`, `ansible/`, `workloads/`, `scripts/`, root files, and (Layer E) `agents/` |
+
+---
+
+## Revision note: what the Layer E merge changed
+
+Layer E (the alert-triage agent) is an **optional, additive extension**. It is
+gated behind one Ansible variable, `triage_agent_enabled`, which defaults to
+`false`. With the flag off, every statement made about Layers A-D in this
+document is unchanged, including "three namespaces" and the 76-requirement
+count. The merge touched the document as follows:
+
+| Section | Change |
+|---|---|
+| 1.7, 1.8 | New: Layer E purpose, constraints, status, and an overlay diagram |
+| 2.11 | New: the design decisions behind Layer E, each with its rejected alternative |
+| 3.11, 3.12 | New: planned files, and the modifications to existing files |
+| 4.6, 4.7 | New: runtime trace of one alert through the agent, and the extended smoke test |
+| 5.7, 5.8 | New: Layer E checklist (all rows marked **Planned**) and the evaluation plan |
+| 5.5, 5.6 | Extended: unverified-claims table and summary now include Layer E |
+
+Nothing in Layer E has been executed. Every Layer E row in section 5 carries
+the status **Planned**, and no result is claimed anywhere.
 
 ---
 
@@ -22,7 +46,8 @@ the exact file and code block that satisfies it.
 
 Where the implementation deviates from a literal reading of the brief, that
 deviation is called out explicitly with the reasoning, in section 5.3. There
-are four such deviations. Nothing was silently substituted.
+are four such deviations. Nothing was silently substituted. Layer E is not a
+deviation: it adds capability beyond the brief and replaces nothing in it.
 
 ---
 
@@ -221,7 +246,74 @@ check or is a performance property no emulator could model.
 
 The k3s container spawned over the Docker socket on the left and the real GKE
 node pool on the right present the same Kubernetes API, which is why the
-bottom two thirds of this diagram are environment-independent.
+bottom two thirds of this diagram are environment-independent. The optional
+fourth namespace, `triage`, is not drawn here; section 1.8 shows it as an
+overlay so the core diagram stays true with the flag off.
+
+## 1.7 Layer E (optional): the read-only alert-triage agent
+
+### What it is
+
+When a Prometheus alert fires, an on-call engineer spends the first minutes
+collecting context: which pod, what the logs say, what changed, what the
+runbook says. Layer E automates **that evidence-gathering step only**. An
+Alertmanager webhook triggers a small service that runs an LLM agent. The
+agent queries Prometheus, Elasticsearch and the Kubernetes API through three
+**read-only MCP servers** and emits a structured triage note: a summary, the
+evidence it found, a likely cause with a confidence value, and suggested
+commands for a human to run.
+
+It reads and proposes. It never changes the cluster.
+
+### Why it belongs in this platform
+
+The platform already produces the three evidence types an incident needs:
+metrics (Prometheus), parsed logs with Kubernetes metadata (Elasticsearch),
+and object state (Kubernetes API). Grafana already correlates the first two
+for a human. Layer E is the same correlation performed on the alert's behalf,
+and it reuses the existing Grok fields (`log_level`, `kubernetes.*`,
+`raw_message`) instead of building a second data path.
+
+### Constraints it inherits
+
+1. **No GCP-native services.** The agent uses open-source components only.
+   The LLM endpoint is a variable (`triage_llm_base_url`) that points at a
+   local Ollama instance by default, so no paid API is required.
+2. **Local first.** It must run on the same 16 GB laptop as the rest of the
+   stack. Section 2.11.6 treats the memory budget honestly.
+3. **Same code, both environments.** One image and one set of manifests; the
+   `is_emulated` flag changes only sizing and the Alertmanager default.
+4. **Feature-flagged.** `triage_agent_enabled: false` by default, so Layers
+   A-D behave exactly as documented without it.
+
+### Status
+
+**Designed, not built.** No Layer E file exists yet, no Layer E test has run,
+and no accuracy figure is claimed. Section 5.8 defines how accuracy will be
+measured once it is built.
+
+## 1.8 Layer E overlay diagram
+
+```
+   Prometheus ──(rule fires)──► Alertmanager ──webhook POST──┐
+   (monitoring)                 (monitoring)                 │
+        ▲                                                    ▼
+        │ read-only PromQL         namespace: triage   ┌──────────────┐
+        │                                              │ triage-agent │──► LLM endpoint
+ ┌──────┴────────┐  ┌────────────────┐ ┌───────────┐   │ FastAPI +    │    (Ollama on host,
+ │ prometheus-mcp│  │ elasticsearch- │ │kubernetes-│◄──┤ Agents SDK   │     or free-tier API)
+ │ (FastMCP)     │  │ mcp (FastMCP)  │ │mcp        │   └──────┬───────┘
+ └──────┬────────┘  └───────┬────────┘ └─────┬─────┘          │
+        │                   │                │                ▼
+   Prometheus :9090   Elasticsearch :9200   K8s API     triage note (JSON):
+                       logstash-k8s-*       get/list/    PVC + /triage/{id}
+                       namespace-scoped     logs only    + stdout -> Filebeat
+```
+
+Each MCP server runs under its own ServiceAccount and holds only the
+permission its one backend needs. The agent holds no cluster credentials at
+all; it can only call tools.
+
 ---
 
 # 2. Design Decisions & Reasoning (The "Why")
@@ -754,7 +846,8 @@ islands: an engineer sees a CPU spike in Grafana and must switch to Kibana to
 find the logs explaining it. With both data sources provisioned, a single
 dashboard can show the metric and the log lines side by side. The
 `logMessageField: raw_message` and `logLevelField: log_level` settings are
-what tie it to the Grok output.
+what tie it to the Grok output. (Layer E, section 2.11, automates the same
+correlation for alert triage.)
 
 ## 2.9 The GCP exporter: the one deliberate rule-break
 
@@ -802,12 +895,160 @@ read metrics.
 The emulator's IAM store has the same read-modify-write shape, so the
 constraint applies identically in both environments. It is therefore set in
 one place, as a Makefile variable consumed by every apply and destroy target.
+
+## 2.11 Layer E (optional): the alert-triage agent
+
+Every decision below is stated with its rejected alternative. All of it is
+**design**; nothing has been built or measured.
+
+### 2.11.1 Why the agent is read-only and suggest-only
+
+**Chosen:** no tool in Layer E can mutate anything. The agent proposes
+commands; a human runs them.
+
+**Rejected:** automated remediation (restart a pod, scale a deployment). An
+LLM that can write to the cluster turns a wrong diagnosis into an outage, and
+the failure is hardest to catch precisely when the model is confidently
+wrong. Read-only means the worst outcome of a bad run is a misleading note,
+which a human can discard. Write tools can be added later, one at a time,
+behind approval, only after the evaluation in section 5.8 shows the diagnoses
+are reliable.
+
+### 2.11.2 Why three MCP servers and not one, and not in-process functions
+
+**Chosen:** one MCP server per backend (Prometheus, Elasticsearch,
+Kubernetes), each a separate Deployment with its own ServiceAccount.
+
+**Rejected (one combined server):** a single process would need credentials
+for all three backends, so compromising it yields all three. Three servers
+mean each holds the minimum for one backend, mirroring the node-SA versus
+exporter-SA separation in section 2.3.
+
+**Rejected (plain Python functions inside the agent):** this is simpler, but
+it puts the credentials in the same process as the LLM loop and makes the
+tools unusable by anything else. As MCP servers, the same tools can later be
+used from an IDE or another client, and the permission boundary is a network
+and RBAC boundary rather than a code convention.
+
+### 2.11.3 What each MCP server exposes, and what it refuses
+
+| Server | Tools | Hard limits enforced in the server, not the prompt |
+|---|---|---|
+| `prometheus-mcp` | `query`, `query_range`, `get_alerts` | Query length cap, range cap, 15 s timeout, series-count cap on results |
+| `elasticsearch-mcp` | `search_logs(namespace, pod?, level?, text?, minutes)` | Index pinned to `logstash-k8s-*`; namespace must be in `triage_allowed_namespaces`; window capped (default 60 min); size capped (default 50 hits); returns a field subset, not whole documents |
+| `kubernetes-mcp` | `get_pod`, `describe_pod`, `list_events`, `get_pod_logs`, `get_workload_status` | Read verbs only; no Secrets and no ConfigMap data; log tail capped by lines and bytes |
+
+Limits live in the server because a limit expressed only in a system prompt
+is a request, not a control. The Elasticsearch server additionally connects
+as a dedicated read-only Elasticsearch role (`triage_reader`, read on
+`logstash-k8s-*` only), so even a bug in the server cannot reach other
+indices.
+
+### 2.11.4 Why an Alertmanager webhook is the trigger
+
+**Chosen:** Alertmanager `webhook_configs` to `POST /alert` on the agent.
+Alertmanager already does grouping, deduplication and inhibition, and
+Layer E should not reimplement them.
+
+**Rejected:** polling Prometheus `/api/v1/alerts` on a timer. That duplicates
+Alertmanager's grouping logic and adds latency and a second source of truth
+about what is firing.
+
+**A fact about this repository that changes the design:** locally
+(`is_emulated: true`) Alertmanager is **off**, and in the cloud it is on. Layer
+E therefore sets `alertmanager.enabled` to
+`(not is_emulated) or triage_agent_enabled`, so enabling the agent locally
+also starts Alertmanager, which costs little. Independently of Alertmanager,
+`POST /alert` accepts the Alertmanager payload format, so the evaluation
+harness and a manual `curl` can trigger the agent with no Alertmanager at all.
+That is also what makes the agent testable in a unit-test sense.
+
+### 2.11.5 Treating logs as hostile input
+
+Log lines are written by workloads, so an attacker who can influence an
+application's output can influence what the agent reads. That is prompt
+injection through observability data, and it is a real risk for this exact
+design. The controls are layered:
+
+1. **No write tools** (2.11.1), so injected instructions cannot cause a
+   change. This is the control that actually bounds the damage.
+2. **Tool results are wrapped as data** in delimiters, and the system prompt
+   states that tool output is evidence and never instructions. This reduces
+   the chance of the model being steered; it does not eliminate it, and the
+   design does not rely on it.
+3. **Structured output.** The agent must return a Pydantic model
+   (`summary`, `evidence[]`, `likely_cause`, `confidence`,
+   `suggested_commands[]`). Suggested commands are rendered as text for a
+   human and never executed.
+4. **Budgets.** A maximum number of tool calls per alert (default 8), a
+   per-run timeout, and a cool-down per alert fingerprint (default 10
+   minutes) so a flapping alert cannot run up cost or loop.
+5. **Audit without reflection.** The agent logs the tool name, arguments and
+   the size and hash of each result to stdout, not the result body. Those
+   lines flow through Filebeat like any other workload's, and omitting bodies
+   stops hostile log content from being re-ingested and re-read.
+6. **Egress NetworkPolicy** on the triage namespace: DNS, the Prometheus,
+   Elasticsearch and API-server endpoints, and the single configured LLM
+   endpoint, and nothing else.
+
+### 2.11.6 The LLM endpoint, and an honest memory budget
+
+**Chosen:** an OpenAI-compatible endpoint set by `triage_llm_base_url` and
+`triage_llm_model`. The default is **Google AI Studio (`gemini-3.5-flash`)**
+via its OpenAI-compatible endpoint
+(`https://generativelanguage.googleapis.com/v1beta/openai/`), authenticated
+by a Kubernetes Secret (`triage-llm-credentials`, `no_log: true`). The OpenAI
+Agents SDK is pointed at it through a custom `AsyncOpenAI` client.
+
+**Why hosted free-tier as default, with Ollama as an optional override:**
+On a 16 GB laptop that already hosts floci-gcp, k3s, Elasticsearch, Logstash,
+Kibana, Prometheus, Grafana and VProfile, running a local 7-8B model
+(in-cluster or on the host) competes with Elasticsearch's heap for the same
+RAM and risks OOM kills. A free-tier hosted model (`gemini-3.5-flash`,
+smoke-tested against the OpenAI endpoint) adds zero local memory overhead and
+provides stronger multi-step tool calling and structured-output reliability.
+Because the endpoint and model are plain variables, switching to a host-run
+Ollama instance or another OpenAI-compatible provider requires zero code
+changes.
+
+**Known risk, stated plainly:** free-tier hosted APIs enforce rate limits
+(RPM/TPM), and any LLM can still loop or return malformed structured output.
+The design contains this with the budgets above (max 8 tool calls, per-run
+timeout, 10-minute per-fingerprint cool-down) and schema validation (an
+invalid response is retried once, then reported as a failed triage, never
+silently accepted).
+
+"""
+
+### 2.11.7 Why runbooks live in a ConfigMap rendered by Jinja2
+
+**Chosen:** `triage-runbooks.yml.j2` renders a ConfigMap keyed by `alertname`,
+one short runbook per alert rule defined in `monitoring-values.yml.j2`. The
+agent loads the matching runbook as context for that alert.
+
+**Rejected:** embedding runbooks in the system prompt (they cannot change
+without an image rebuild) or fetching them from an external wiki (a new
+dependency and a new credential). In a ConfigMap they are versioned in the
+same repository as the alert rules and updated by the same playbook run, so
+a rule and its runbook cannot drift apart silently.
+
+### 2.11.8 Why the agent exports its own metrics
+
+The agent exposes `triage_runs_total{outcome}`, `triage_duration_seconds`
+and `triage_tool_calls_total{tool}` through a ServiceMonitor, picked up by the
+existing `serviceMonitorSelectorNilUsesHelmValues: false` setting without
+touching the monitoring release. A failure-rate alert on the agent itself
+closes the loop: the platform that observes everything else also observes its
+own triage component.
+
 ---
 
 # 3. File-by-File Breakdown
 
 Every generated file, its role, its key configuration, and how it connects to
-the rest of the stack.
+the rest of the stack. Sections 3.1-3.10 describe Layers A-D as implemented.
+Section 3.11 lists Layer E files, which are **planned**, and section 3.12
+lists the edits Layer E makes to existing files.
 
 ## 3.1 Root files
 
@@ -838,6 +1079,7 @@ its health endpoint and verifies the socket mount.
 
 **Role.** The single entry point for every workflow. 30+ targets in six
 groups: emulator, local Terraform, cloud Terraform, Ansible, workload, access.
+(Layer E adds a seventh group, section 3.12.)
 
 **Key configuration.**
 
@@ -906,7 +1148,8 @@ hanging on an unreachable endpoint - three steps removed from the cause.
 rather than sleeping a fixed interval. A `trap` on EXIT/INT/TERM kills every
 background forward. The Elasticsearch password is read from the Kubernetes
 Secret rather than passed in. `SKIP_EMULATOR=1` makes it run unchanged against
-real GCP.
+real GCP. When `triage_agent_enabled` is true, a seventh group is appended
+(section 4.7); with the flag off the script is unchanged.
 
 **Why check 5 is the important one.** Asserting that an index exists only
 proves logs arrived. Asserting a document with `http_status: 404` **and**
@@ -952,7 +1195,8 @@ separate resource.
 **Connects to.** `node_service_account_email` goes to the GKE node pool.
 `exporter_service_account_email` flows through `stack`'s `ansible_facts`
 output into the playbook, which writes it into the
-`iam.gke.io/gcp-service-account` annotation.
+`iam.gke.io/gcp-service-account` annotation. Layer E adds **no** Terraform and
+no GCP IAM: its identities are Kubernetes ServiceAccounts only.
 
 ## 3.5 `terraform/modules/gke/`
 
@@ -1155,12 +1399,72 @@ limits, which is mandatory because the `workload` namespace enforces a
 
 `Secret/vprofile-secrets` supplies `MYSQL_ROOT_PASSWORD`, `RABBITMQ_DEFAULT_USER`,
 and `RABBITMQ_DEFAULT_PASS` to `vprodb` and `vpromq01` via `secretKeyRef`.
+
+## 3.11 Layer E files (planned, not yet created)
+
+```
+agents/
+├── triage-agent/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app/
+│       ├── main.py          FastAPI: POST /alert, GET /triage/{fingerprint}, /healthz, /metrics
+│       ├── agent.py         OpenAI Agents SDK loop, budgets, retry-once on invalid output
+│       ├── schemas.py       Pydantic: AlertmanagerPayload, TriageNote
+│       └── prompts.py       system prompt, data-wrapping of tool output
+├── mcp-servers/
+│   ├── prometheus_mcp.py    FastMCP, streamable-http
+│   ├── elasticsearch_mcp.py FastMCP, streamable-http
+│   └── kubernetes_mcp.py    FastMCP, streamable-http
+└── eval/
+    ├── faults/              one manifest + one expected-cause file per fault
+    ├── payloads/            synthetic Alertmanager payloads per fault
+    └── run_eval.py          injects, triggers, scores, prints X of Y
+
+ansible/templates/
+├── triage-agent.yml.j2      namespace objects, 4 Deployments, Services, NetworkPolicy,
+│                            ServiceMonitor, ResourceQuota, results PVC
+└── triage-runbooks.yml.j2   ConfigMap keyed by alertname
+```
+
+| File | Role | Key configuration |
+|---|---|---|
+| `agents/triage-agent/app/main.py` | Receives the Alertmanager webhook, de-duplicates by fingerprint, runs the agent, stores the note | Accepts the Alertmanager v4 payload (`status`, `alerts[].labels`, `annotations`, `startsAt`, `fingerprint`); one run at a time (queue) because the local LLM is the bottleneck; 10-minute per-fingerprint cool-down |
+| `agents/triage-agent/app/agent.py` | The tool-calling loop | OpenAI Agents SDK; custom client at `triage_llm_base_url`; max tool calls 8; per-run timeout; structured output `TriageNote` |
+| `agents/mcp-servers/*.py` | One read-only MCP server per backend | Limits from section 2.11.3 enforced in code; each exposes streamable HTTP on its own port |
+| `ansible/templates/triage-agent.yml.j2` | Everything Layer E deploys | Own ServiceAccount per Deployment; read-only Role/ClusterRole `obs-triage-reader` with no Secrets access; egress NetworkPolicy; ServiceMonitor for agent metrics |
+| `ansible/templates/triage-runbooks.yml.j2` | Runbook ConfigMap | One entry per alert rule in `monitoring-values.yml.j2`, keyed by `alertname` |
+| `agents/eval/run_eval.py` | Measures the agent | Section 5.8 |
+
+**Image delivery on the local phase.** The k3s node does not pull from the
+host's Docker daemon. `make triage-build` builds the four images (agent plus
+three MCP servers) and imports them into the k3s container's runtime. How
+exactly depends on the container name and tooling the emulator spawns and
+must be confirmed when this is first run. In the cloud, the same images are
+pushed to a registry and the manifests reference them by tag.
+
+## 3.12 Edits Layer E makes to existing files
+
+All edits are conditional on `triage_agent_enabled`, so a run with the flag
+off renders exactly what it rendered before.
+
+| Existing file | Edit |
+|---|---|
+| `ansible/group_vars/all.yml` | New variables: `triage_agent_enabled` (default `false`), `triage_namespace` (`triage`), `triage_llm_base_url`, `triage_llm_model`, `triage_max_tool_calls` (8), `triage_cooldown_minutes` (10), `triage_allowed_namespaces` (`workload`, `monitoring`), `triage_image_tag` |
+| `ansible/templates/monitoring-values.yml.j2` | `alertmanager.enabled` becomes `(not is_emulated) or triage_agent_enabled`; adds one webhook receiver to `http://triage-agent.triage.svc:8080/alert` and a route that sends alerts to it **in addition to** existing receivers (`continue: true`) so nothing else changes |
+| `ansible/playbook.yml` | New task group tagged `triage`, guarded by `when: triage_agent_enabled`: create the `triage` namespace, the Elasticsearch `triage_reader` role and user and its Secret (`no_log: true`), render both templates, apply, wait for the four Deployments |
+| `Makefile` | New group: `triage-build`, `triage-deploy`, `triage-eval`, `triage-logs` |
+| `scripts/smoke-test.sh` | Seventh check group, run only when the flag is on (section 4.7) |
+| `ansible/templates/elk-values.yml.j2` | No change. `drop_event` still drops only `logging` and `kube-system`, so triage-namespace logs flow like any workload's |
+
 ---
+
 
 # 4. End-to-End Runtime & Execution Flow
 
 What actually happens, in order, from a cold machine to a parsed log line in
-Kibana and a GCP metric in Grafana.
+Kibana and a GCP metric in Grafana. Sections 4.1-4.5 cover Layers A-D;
+sections 4.6-4.7 trace Layer E.
 
 ## 4.1 Phase 1 - Infrastructure provisioning
 
@@ -1381,6 +1685,11 @@ The five tiers roll out in dependency order: `vprodb` initializes MySQL and
 imports the `accounts` schema, `vproapp`'s `wait-for-db` init container unblocks
 once port 3306 responds, and `vproweb` begins proxying HTTP traffic and exposing
 NGINX metrics on `:9113`.
+
+### Step 6 (optional, Layer E): `make triage-build && make triage-deploy`
+
+Only when `triage_agent_enabled=true`. Described in section 4.6.1. With the
+flag off these targets do nothing and Steps 1-5 are unchanged.
 
 ## 4.3 Phase 3 - The live logging pipeline
 
@@ -1607,7 +1916,122 @@ kube_pod_status_phase     → KSM returning data
 nginx_http_requests_total → annotation discovery works
 ```
 
-Exit code 0 means both pipelines are live end to end.
+Exit code 0 means both pipelines are live end to end. With
+`triage_agent_enabled=true`, section 4.7 appends a further group.
+
+## 4.6 Phase 4 (optional, Layer E) - one alert through the triage agent
+
+Everything in this section is the **intended** runtime, written from the
+design. It has not been executed. The example note in 4.6.4 is illustrative,
+not a recorded output.
+
+### 4.6.1 Bring-up
+
+```
+make triage-build
+ ├─ docker build ×4   (triage-agent, prometheus-mcp, elasticsearch-mcp, kubernetes-mcp)
+ └─ import the images into the k3s node's runtime          ← confirm method on first run
+
+make triage-deploy    (ansible-playbook --tags triage -e triage_agent_enabled=true)
+ ├─ re-render monitoring-values.yml: Alertmanager on, webhook receiver added
+ ├─ helm upgrade kube-prometheus-stack                      ← the only change to a Layer D release
+ ├─ create namespace triage + ResourceQuota
+ ├─ create ES role triage_reader + user, store in triage-es-credentials (no_log)
+ ├─ render + apply triage-runbooks.yml.j2 and triage-agent.yml.j2
+ └─ wait for 4 Deployments Ready
+```
+
+The LLM is not started by this target. The operator runs Ollama on the host
+and sets `triage_llm_base_url` to it (section 2.11.6).
+
+### 4.6.2 Trigger
+
+A PrometheusRule fires. Prometheus sends it to Alertmanager, which applies
+its grouping window and then issues:
+
+```
+POST http://triage-agent.triage.svc:8080/alert
+{ "status": "firing",
+  "alerts": [ { "labels": { "alertname": "<rule>", "namespace": "workload",
+                            "pod": "vproapp-5c8d-x9k2", "severity": "warning" },
+                "annotations": { "summary": "..." },
+                "startsAt": "2026-11-25T10:02:11Z",
+                "fingerprint": "<hash>" } ] }
+```
+
+The existing receivers still fire as before, because the new route uses
+`continue: true`. Without Alertmanager, the same body can be sent by
+`curl` or by the evaluation harness; the agent cannot tell the difference.
+
+### 4.6.3 The agent loop
+
+```
+1. main.py validates the payload (Pydantic). Invalid → 422, no LLM call.
+2. If fingerprint is inside the 10-minute cool-down → 200, "deduplicated", stop.
+3. Enqueue (one run at a time). agent.py loads the runbook for this alertname
+   from the ConfigMap and builds the prompt: alert labels, runbook, rules.
+4. The LLM requests tools. Each call goes to an MCP server over HTTP:
+
+   prometheus-mcp     query_range(restarts / cpu / memory for the pod, last 30 min)
+   kubernetes-mcp     get_pod, list_events(pod), get_pod_logs(previous container)
+   elasticsearch-mcp  search_logs(namespace=workload, pod=..., level=ERROR, minutes=30)
+
+   Every call is checked against limits inside the server (2.11.3).
+   Every call is audit-logged as tool + args + result size/hash (2.11.5).
+5. After at most 8 tool calls or the timeout, the model must return a TriageNote.
+   Invalid → one retry → otherwise outcome="failed", reported as such.
+6. The note is stored on the results PVC, exposed at GET /triage/<fingerprint>,
+   and printed to stdout as one JSON line. triage_runs_total{outcome} increments.
+```
+
+### 4.6.4 Illustrative output shape
+
+```json
+{
+  "summary": "vproapp is crash-looping; the previous container exited with an error before Tomcat finished starting.",
+  "evidence": [
+    "kube_pod_container_status_restarts_total rose from 0 to 6 in 12 minutes",
+    "Event: Back-off restarting failed container",
+    "Previous-container log tail ends in a connection error to vprodb:3306"
+  ],
+  "likely_cause": "Database not reachable when the app started",
+  "confidence": "medium",
+  "suggested_commands": [
+    "kubectl -n workload get pods -l app=vprodb",
+    "kubectl -n workload logs deploy/vprodb --tail=100"
+  ]
+}
+```
+
+`confidence` is the model's own stated value and is not calibrated. Section
+5.8 is how it will be checked against ground truth.
+
+### 4.6.5 What the on-call engineer gets, and what they do not
+
+They get a hypothesis, the evidence behind it, and commands to run, usually
+before they have opened a terminal. They do **not** get an action taken, a
+guarantee that the hypothesis is right, or a substitute for reading the
+evidence themselves.
+
+## 4.7 Smoke test extension (Layer E)
+
+Appended to `smoke-test.sh` only when `triage_agent_enabled=true`. Check
+numbering continues from the existing six groups.
+
+| # | Checks | Method |
+|---|---|---|
+| 7a | Four triage pods Running and Ready | `kubectl -n triage get pods` |
+| 7b | Agent liveness and its three MCP backends reachable | `GET /healthz` reports each MCP server's status |
+| 7c | **Read-only holds** | `kubectl auth can-i create/update/delete pods --as=system:serviceaccount:triage:<each SA>` must answer `no` for every mutating verb; `get secrets` must answer `no` |
+| 7d | Scope holds | `elasticsearch-mcp` refused a query for namespace `kube-system` (not in the allowlist) |
+| 7e | End-to-end with a synthetic payload | `POST /alert` with a canned payload; assert 200, then assert `GET /triage/<fingerprint>` returns a schema-valid `TriageNote` |
+| 7f | Metrics exposed | `triage_runs_total` present in Prometheus |
+
+7c and 7d are the checks that matter most: they test the security properties
+of section 2.11 directly rather than assuming them. 7e checks that the
+pipeline works and that the output is well-formed. It does **not** check that
+the diagnosis is correct; that is the evaluation in section 5.8.
+
 ---
 
 # 5. Validation & Alignment Checklist
@@ -1615,6 +2039,8 @@ Exit code 0 means both pipelines are live end to end.
 Each requirement from the brief, mapped to the file and code construct that
 satisfies it. Verified by rendering every template for both environments and
 asserting on the parsed output; the assertion results are in section 5.4.
+Sections 5.1-5.6 cover Layers A-D. Layer E has its own checklist (5.7) and
+evaluation plan (5.8), kept separate because none of its rows are verified.
 
 ## 5.1 Section 1 of the brief - overview, stack, strategy
 
@@ -1739,6 +2165,10 @@ asserting on the parsed output; the assertion results are in section 5.4.
 | E.3.5 | Query ES `_cat/indices` and `_search` | `scripts/smoke-test.sh` | check 5: both, plus per-field existence assertions |
 | E.3.6 | Query Prometheus `/api/v1/targets` | `scripts/smoke-test.sh` | check 6: targets plus real PromQL per exporter |
 
+(The `E.` prefix in this table is the brief's local-emulation group, and is
+unrelated to **Layer E**. Layer E rows use the `X.` prefix in section 5.7 to
+avoid the collision.)
+
 ### Documented deviations
 
 Four places where the implementation does not follow the brief literally.
@@ -1813,6 +2243,9 @@ The specific structural assertions run against the parsed output:
 - the exporter Deployment uses `serviceAccountName: gcp-exporter-sa`, listens
   on 9255 and lives in the `monitoring` namespace
 
+This verification covers Layers A-D only. No Layer E template exists yet, so
+none has been rendered or asserted on.
+
 ## 5.5 What has not been verified, and how to verify it
 
 Static validation cannot prove runtime behaviour. These require a machine
@@ -1827,6 +2260,10 @@ with Docker and the tooling from README section 2:
 | Logs flow end to end with parsed fields | `make workload && make smoke` (check 5) |
 | Exporters register and return data | `make smoke` (check 6) |
 | **Workload Identity token exchange** | README section 5.7 - the metadata-server query. This is the one thing the local phase cannot prove |
+| *(Layer E)* Images build and import into k3s | `make triage-build`; method of import to be confirmed on first run |
+| *(Layer E)* Agent is read-only and scoped | `make smoke` checks 7c and 7d |
+| *(Layer E)* Webhook path works through real Alertmanager | Fire a real rule, then `GET /triage/<fingerprint>` |
+| *(Layer E)* Local LLM can drive the tool loop reliably | `make triage-eval`, section 5.8; the outcome is unknown |
 
 Chart versions (`elastic 8.5.1`, `kube-prometheus-stack 65.5.1`) are pinned
 from known-good releases. If your registry mirror does not carry them, change
@@ -1844,7 +2281,83 @@ numbers.
 | 2D. Metrics pipeline | 15 | 15 | 2 (exporter interval, Operator-generated StatefulSet) |
 | 3. Local emulation rules | 8 | 8 | 1 (health endpoint path corrected) |
 | 4. Directory structure | 29 files | 29 files | 0 |
-| **Total** | **76 + 29 files** | **76 + 29 files** | **4, all documented in 5.3** |
+| **Total (Layers A-D)** | **76 + 29 files** | **76 + 29 files** | **4, all documented in 5.3** |
+| Extension: Layer E (optional) | 14 (section 5.7) | **0 built, 0 verified** | n/a, additive and flag-gated |
 
 Every file in the requested tree exists at the requested path, with no `TODO`
-placeholders and no elided sections.
+placeholders and no elided sections. That statement covers the 29 files of the
+original tree; the Layer E files in section 3.11 are not part of that tree and
+do not yet exist.
+
+## 5.7 Layer E checklist (all rows: Planned)
+
+Layer E was not in the brief; it is an extension. Each row states what the
+design commits to. **Status for every row is Planned.** A row moves to
+Verified only when the command in the last column has run and passed.
+
+| # | Commitment | Planned file | Planned construct | How it will be verified |
+|---|---|---|---|---|
+| X.1 | Feature-flagged; off by default | `group_vars/all.yml` | `triage_agent_enabled: false`; every Layer E task guarded by `when:` | Render with the flag off; diff against current rendered output must be empty |
+| X.2 | Alertmanager webhook trigger | `monitoring-values.yml.j2` | receiver `triage-agent`, route with `continue: true` | Fire a rule; agent receives exactly one POST; existing receivers still fire |
+| X.3 | Alertmanager available locally when the flag is on | `monitoring-values.yml.j2` | `alertmanager.enabled: (not is_emulated) or triage_agent_enabled` | Local render with flag on shows Alertmanager enabled; flag off shows disabled |
+| X.4 | Three read-only MCP servers, one per backend | `agents/mcp-servers/*.py`, `triage-agent.yml.j2` | one Deployment + ServiceAccount each | Smoke 7a, 7b |
+| X.5 | No mutating verbs, no Secrets access | `triage-agent.yml.j2` | Role/ClusterRole `obs-triage-reader` | Smoke 7c |
+| X.6 | Elasticsearch access limited to `logstash-k8s-*` and an allowlist of namespaces | `elasticsearch_mcp.py`, `playbook.yml` | pinned index; `triage_allowed_namespaces`; ES role `triage_reader` | Smoke 7d |
+| X.7 | Hard limits enforced in server code | `*_mcp.py` | query/range/size/window/log-tail caps | Unit tests against each server with over-limit inputs |
+| X.8 | Structured output, schema-validated, retry once | `schemas.py`, `agent.py` | Pydantic `TriageNote` | Smoke 7e; unit test with a malformed model response |
+| X.9 | Per-run and per-alert budgets | `agent.py`, `main.py` | max tool calls, timeout, per-fingerprint cool-down | Unit tests: 9th tool call refused; repeat fingerprint deduplicated |
+| X.10 | Audit log without result bodies | `agent.py` | tool, args, result size and hash only | Grep a run's stdout for a known log marker; it must be absent |
+| X.11 | Egress-restricted namespace | `triage-agent.yml.j2` | `NetworkPolicy` | From a triage pod, a request to an arbitrary external host fails |
+| X.12 | Agent exports its own metrics | `triage-agent.yml.j2` | `ServiceMonitor`; `triage_runs_total` etc. | Smoke 7f |
+| X.13 | Runbooks versioned beside alert rules | `triage-runbooks.yml.j2` | ConfigMap keyed by `alertname` | Every alert rule has a runbook entry (render-time assertion) |
+| X.14 | Diagnosis quality measured, not assumed | `agents/eval/` | fault injection harness | Section 5.8 |
+
+## 5.8 Layer E evaluation plan
+
+The value of the agent is whether its diagnoses are right. A working webhook
+and a well-formed JSON note prove nothing about that, so the evaluation is a
+first-class deliverable and not an afterthought.
+
+**Method.** For each fault, `run_eval.py`:
+
+1. applies a manifest that creates a known fault in the `workload` namespace
+   (or a dedicated `triage-eval` namespace, added to the allowlist for the
+   run);
+2. waits for the symptom to be visible in Prometheus, Elasticsearch and the
+   Kubernetes API;
+3. sends a synthetic Alertmanager payload for that fault to `POST /alert`
+   (fast and deterministic), and for a subset also waits for the **real**
+   alert through Alertmanager;
+4. scores the returned `TriageNote` against an `expected-cause` file
+   (a category such as `bad-probe-target`, plus keywords that must appear in
+   `likely_cause` or `evidence`);
+5. deletes the fault and records the result.
+
+**Initial fault set** (each reproduces a failure mode this platform has
+either already hit or can hit):
+
+| Fault | Ground truth |
+|---|---|
+| Container that exits non-zero on start (crash loop) | exit cause visible in previous-container logs |
+| Readiness probe pointed at the wrong port/path | probe failure events; pod never Ready while process is up |
+| Container exceeding its memory limit | OOMKilled in last state |
+| Image that cannot be pulled | `ImagePullBackOff` events |
+| Dependency unavailable at start (app started before DB) | connection error in logs, DB pod not Ready |
+| Elevated 5xx from `vproweb` | `log_level: ERROR` spike with `http_status >= 500` |
+
+**Reporting.** The result is reported as correct-category **X of Y** with the
+fault list beside it, plus the failure cases and what the agent said. Because
+local-model runs vary, each fault is run a fixed number of times (for example
+three) and per-run results are kept. The figure is published only after it is
+measured. No accuracy number appears anywhere in this document, and none
+should be quoted from it.
+
+**Decision rule.** If the local model cannot reach an acceptable score, the
+response is to change `triage_llm_base_url` to a hosted free-tier model and
+re-run the same evaluation, not to loosen the scoring. The comparison between
+models is itself a useful result.
+
+**What the evaluation does not cover.** It tests six injected faults on a
+single-node cluster. It does not show the agent handles novel failures, noisy
+multi-alert incidents, or adversarial log content. Section 2.11.5 is a design
+argument for the last of these, not a test of it.

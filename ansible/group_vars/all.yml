@@ -215,3 +215,17 @@ rendered_dir: "{{ playbook_dir }}/rendered"
 helm_wait: true
 helm_timeout: 15m
 rollout_timeout: 600
+
+# --- Layer E: Read-Only Alert-Triage Agent (Feature-Flagged) ---------------
+triage_agent_enabled: false
+triage_namespace: triage
+triage_agent_image: "obs-triage-agent:local"
+triage_mcp_image: "obs-mcp-servers:local"
+triage_llm_base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+triage_llm_model: "gemini-3.5-flash-lite"
+vault_triage_llm_api_key: "{{ lookup('env', 'GEMINI_API_KEY') | default('', true) }}"
+triage_max_tool_calls: 8
+triage_cooldown_minutes: 10
+triage_allowed_namespaces: "workload,monitoring,logging"
+triage_es_allowed_namespaces: "workload,monitoring"
+triage_storage_size: 1Gi
