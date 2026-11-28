@@ -50,3 +50,6 @@ vault-password*
 .DS_Store
 Thumbs.db
 agents/.venv/
+
+__pycache__/
+*.pyc
