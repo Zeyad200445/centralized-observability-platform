@@ -483,6 +483,13 @@ kibana:
 # 4. FILEBEAT - DaemonSet, exactly one pod per node
 # ===========================================================================
 filebeat:
+  extraInitContainers: |
+    - name: clear-stale-lock
+      image: busybox:1.36
+      command: ["sh", "-c", "rm -f /usr/share/filebeat/data/filebeat.lock"]
+      volumeMounts:
+        - name: data
+          mountPath: /usr/share/filebeat/data
   daemonset:
     enabled: true
     {% if elasticsearch_tls_enabled | bool %}

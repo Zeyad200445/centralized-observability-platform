@@ -138,24 +138,7 @@ prometheus-node-exporter:
     targetPort: {{ node_exporter_port }}
 
   hostRootFsMount:
-    enabled: {{ 'true' if (not is_emulated or triage_agent_enabled) else 'false' }}
-{% if triage_agent_enabled %}
-  config:
-    route:
-      receiver: 'null'
-      group_wait: 15s
-      group_interval: 1m
-      repeat_interval: 10m
-      routes:
-        - receiver: 'triage-agent'
-          continue: true
-    receivers:
-      - name: 'null'
-      - name: 'triage-agent'
-        webhook_configs:
-          - url: 'http://triage-agent.{{ triage_namespace }}.svc:8080/alert'
-            send_resolved: false
-{% endif %}
+    enabled: {{ 'false' if is_emulated else 'true' }}
     mountPropagation: HostToContainer
 
   # /proc and /sys are the whole point of this exporter.
@@ -389,7 +372,24 @@ grafana:
 # ALERTING
 # ===========================================================================
 alertmanager:
-  enabled: {{ 'false' if is_emulated else 'true' }}
+  enabled: {{ 'true' if (triage_agent_enabled | default(false) | bool or not is_emulated) else 'false' }}
+{% if triage_agent_enabled | default(false) | bool %}
+  config:
+    route:
+      receiver: 'null'
+      group_wait: 15s
+      group_interval: 1m
+      repeat_interval: 10m
+      routes:
+        - receiver: 'triage-agent'
+          continue: true
+    receivers:
+      - name: 'null'
+      - name: 'triage-agent'
+        webhook_configs:
+          - url: 'http://triage-agent.{{ triage_namespace }}.svc:8080/alert'
+            send_resolved: false
+{% endif %}
   alertmanagerSpec:
     replicas: 1
     storage:
@@ -445,7 +445,7 @@ additionalPrometheusRulesMap:
               description: External GCP service metrics are no longer being collected.
 
           - alert: WorkloadPodCrashLooping
-            expr: increase(kube_pod_container_status_restarts_total{namespace="{{ workload_namespace }}"}[15m]) > 3
+            expr: increase(kube_pod_container_status_restarts_total{namespace!="kube-system"}[15m]) > 3
             for: 5m
             labels:
               severity: warning
@@ -473,7 +473,7 @@ prometheusOperator:
 # GKE and k3s both hide the control plane, so scraping these endpoints only
 # produces permanently-down targets and noisy alerts.
 kubeApiServer:
-  enabled: {{ 'false' if is_emulated else 'true' }}
+  enabled: {{ 'true' if (triage_agent_enabled | default(false) | bool or not is_emulated) else 'false' }}
 kubeControllerManager:
   enabled: false
 kubeScheduler:
